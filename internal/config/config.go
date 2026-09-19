@@ -42,10 +42,12 @@ type Config struct {
 	RemoveUnselected bool
 
 	// Runtime
-	Interval  time.Duration
-	StateFile string
-	DryRun    bool
-	LogLevel  string
+	Interval    time.Duration
+	StateFile   string
+	DryRun      bool
+	LogLevel    string
+	HTTPAddr    string // metrics/health listener
+	ServiceName string
 }
 
 // Load reads configuration from the environment. Missing required values are
@@ -67,6 +69,8 @@ func Load() (*Config, error) {
 		StateFile:        env("STATE_FILE", "/data/state.json"),
 		DryRun:           envBool("DRY_RUN", false),
 		LogLevel:         env("LOG_LEVEL", "info"),
+		HTTPAddr:         env("HTTP_ADDR", ":8080"),
+		ServiceName:      env("OTEL_SERVICE_NAME", "immich-skylight"),
 	}
 
 	var errs []error

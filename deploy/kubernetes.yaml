@@ -1,0 +1,94 @@
+---
+# Plain-Kubernetes equivalent of deploy/flatops (no Flux / app-template).
+# Create the Secret first:
+#   kubectl -n default create secret generic immich-skylight \
+#     --from-literal=IMMICH_API_KEY=... --from-literal=SKYLIGHT_EMAIL=... --from-literal=SKYLIGHT_PASSWORD=...
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: immich-skylight-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: immich-skylight
+  labels:
+    app.kubernetes.io/name: immich-skylight
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: immich-skylight
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: immich-skylight
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: immich-skylight
+          image: ghcr.io/jfroy/immich-skylight:latest
+          args: [run]
+          env:
+            - name: IMMICH_URL
+              value: http://immich-server.default.svc.cluster.local:2283
+            - name: IMMICH_FAVORITES
+              value: "true"
+            - name: STATE_FILE
+              value: /data/state.json
+          envFrom:
+            - secretRef:
+                name: immich-skylight
+          ports:
+            - name: http
+              containerPort: 8080
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 5
+            failureThreshold: 6
+          resources:
+            requests: { cpu: 10m, memory: 64Mi }
+            limits: { memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: immich-skylight-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: immich-skylight
+  labels:
+    app.kubernetes.io/name: immich-skylight
+spec:
+  selector:
+    app.kubernetes.io/name: immich-skylight
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

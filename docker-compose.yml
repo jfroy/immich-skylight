@@ -1,9 +1,0 @@
-services:
-  immich-skylight:
-    build: .
-    image: immich-skylight:latest
-    container_name: immich-skylight
-    restart: unless-stopped
-    env_file: .env
-    volumes:
-      - ./data:/data

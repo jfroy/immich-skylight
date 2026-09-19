@@ -14,10 +14,10 @@ import (
 
 // Sent records an asset that has been uploaded to Skylight.
 type Sent struct {
-	MessageIDs []int     `json:"message_ids"`
-	FrameIDs   []string  `json:"frame_ids"`
-	Checksum   string    `json:"checksum,omitempty"`
-	SentAt     time.Time `json:"sent_at"`
+	// Messages maps Skylight frame ID -> message IDs created on that frame.
+	Messages map[string][]int `json:"messages"`
+	Checksum string           `json:"checksum,omitempty"`
+	SentAt   time.Time        `json:"sent_at"`
 }
 
 // Tokens holds the Skylight OAuth credentials.
@@ -35,12 +35,12 @@ type State struct {
 	Sent        map[string]Sent `json:"sent"` // Immich asset ID -> upload record
 
 	path string
-	mu   sync.Mutex
+	mu   sync.RWMutex
 }
 
 // Load reads the state file, creating a fresh state if it does not exist.
 func Load(path string) (*State, error) {
-	s := &State{Version: 1, Sent: map[string]Sent{}, path: path}
+	s := &State{Version: 2, Sent: map[string]Sent{}, path: path}
 	b, err := os.ReadFile(path)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
@@ -62,13 +62,13 @@ func Load(path string) (*State, error) {
 
 // Save atomically writes the state to disk.
 func (s *State) Save() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
+	s.mu.RLock()
+	b, err := json.MarshalIndent(s, "", "  ")
+	s.mu.RUnlock()
+	if err != nil {
 		return err
 	}
-	b, err := json.MarshalIndent(s, "", "  ")
-	if err != nil {
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
 		return err
 	}
 	tmp := s.path + ".tmp"
@@ -76,6 +76,32 @@ func (s *State) Save() error {
 		return err
 	}
 	return os.Rename(tmp, s.path)
+}
+
+// Has reports whether an asset has been sent.
+func (s *State) Has(assetID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.Sent[assetID]
+	return ok
+}
+
+// Snapshot returns a copy of the sent map.
+func (s *State) Snapshot() map[string]Sent {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]Sent, len(s.Sent))
+	for k, v := range s.Sent {
+		out[k] = v
+	}
+	return out
+}
+
+// Count returns the number of tracked assets.
+func (s *State) Count() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.Sent)
 }
 
 // MarkSent records an uploaded asset.
@@ -97,6 +123,13 @@ func (s *State) SetTokens(t Tokens) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Tokens = t
+}
+
+// GetTokens returns the stored Skylight tokens.
+func (s *State) GetTokens() Tokens {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Tokens
 }
 
 // newUUID returns a random RFC 4122 v4 UUID string.

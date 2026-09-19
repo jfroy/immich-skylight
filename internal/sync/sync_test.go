@@ -14,7 +14,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/jfroy/immich-skylight/internal/config"
+	"github.com/jfroy/immich-skylight/internal/metrics"
 	"github.com/jfroy/immich-skylight/internal/skylight"
 	"github.com/jfroy/immich-skylight/internal/state"
 )
@@ -97,6 +100,7 @@ type fakeSkylight struct {
 	captions []string
 	nextID   int
 	expireIn int
+	revoked  string // bearer token that should be rejected
 }
 
 func (f *fakeSkylight) handler(t *testing.T, self func() string) http.Handler {
@@ -149,7 +153,11 @@ func (f *fakeSkylight) handler(t *testing.T, self func() string) http.Handler {
 		fmt.Fprintf(w, `{"access_token":"A%d","refresh_token":"R1","expires_in":%d,"token_type":"Bearer"}`, f.logins+f.refresh, exp)
 	})
 	auth := func(w http.ResponseWriter, r *http.Request) bool {
-		if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer A") {
+		f.mu.Lock()
+		revoked := f.revoked
+		f.mu.Unlock()
+		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !strings.HasPrefix(tok, "A") || (revoked != "" && tok == revoked) {
 			http.Error(w, `{"errors":["Invalid token"]}`, 401)
 			return false
 		}
@@ -215,6 +223,21 @@ func (f *fakeSkylight) handler(t *testing.T, self func() string) http.Handler {
 	return mux
 }
 
+func newSyncer(t *testing.T, cfg *config.Config, st *state.State) (*Syncer, error) {
+	t.Helper()
+	reg := prometheus.NewRegistry()
+	rec, err := metrics.New(reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return New(context.Background(), Options{
+		Config: cfg, State: st, Logger: slog.Default(), Metrics: rec,
+		SkylightBaseURL: skyBase + "/api",
+	})
+}
+
+var skyBase string
+
 func setup(t *testing.T, cfgMut func(*config.Config)) (*fakeImmich, *fakeSkylight, *config.Config, *state.State) {
 	t.Helper()
 	fi := &fakeImmich{}
@@ -225,7 +248,8 @@ func setup(t *testing.T, cfgMut func(*config.Config)) (*fakeImmich, *fakeSkyligh
 	var skySrv *httptest.Server
 	skySrv = httptest.NewServer(fs.handler(t, func() string { return skySrv.URL }))
 	t.Cleanup(skySrv.Close)
-	skylight.SetBaseURL(skySrv.URL)
+	skylight.SetAuthBaseURL(skySrv.URL)
+	skyBase = skySrv.URL
 
 	cfg := &config.Config{
 		ImmichURL: imSrv.URL, ImmichAPIKey: "key", Favorites: true,
@@ -252,11 +276,11 @@ func TestEndToEnd(t *testing.T) {
 	fi.tagged = []map[string]any{asset("a", "image/jpeg", "IMAGE"), asset("b", "image/heic", "IMAGE")}
 
 	ctx := context.Background()
-	s, err := New(ctx, cfg, st, slog.Default())
+	s, err := newSyncer(t, cfg, st)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if got := s.frame; len(got) != 1 || got[0] != "111" {
+	if got := s.frames; len(got) != 1 || got[0] != "111" {
 		t.Fatalf("frame resolution = %v", got)
 	}
 	if err := s.Once(ctx); err != nil {
@@ -314,13 +338,16 @@ func TestEndToEnd(t *testing.T) {
 	if st2.Tokens.RefreshToken != "R1" || len(st2.Sent) != 1 || st2.Fingerprint != st.Fingerprint {
 		t.Errorf("persisted state mismatch: %+v", st2)
 	}
+	if got := st2.Sent["b"].Messages["111"]; len(got) != 1 {
+		t.Errorf("persisted state mismatch: %+v", st2)
+	}
 }
 
 func TestRenditionFallback(t *testing.T) {
 	fi, fs, cfg, st := setup(t, func(c *config.Config) { c.ImageSource = config.SourceOriginal })
 	fi.favorites = []map[string]any{asset("jpg", "image/jpeg", "IMAGE"), asset("heic", "image/heic", "IMAGE"), asset("nofull", "image/x-canon-cr2", "IMAGE")}
 
-	s, err := New(context.Background(), cfg, st, slog.Default())
+	s, err := newSyncer(t, cfg, st)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,10 +369,10 @@ func TestRenditionFallback(t *testing.T) {
 func TestTokenRefreshAndReauth(t *testing.T) {
 	fi, fs, cfg, st := setup(t, nil)
 	fi.favorites = []map[string]any{asset("a", "image/jpeg", "IMAGE")}
-	fs.expireIn = 30 // < 1 minute safety margin -> immediately considered expired
+	fs.expireIn = 30 // < 1 minute safety margin -> immediately considered expired on next use
 
 	ctx := context.Background()
-	s, err := New(ctx, cfg, st, slog.Default())
+	s, err := newSyncer(t, cfg, st)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,8 +383,10 @@ func TestTokenRefreshAndReauth(t *testing.T) {
 		t.Errorf("expected password login once then refreshes; logins=%d refresh=%d", fs.logins, fs.refresh)
 	}
 
-	// Corrupt the refresh token: next call must fall back to password login.
+	// Corrupt the refresh token and expire the session: next call must fall
+	// back to password login.
 	st.SetTokens(state.Tokens{AccessToken: "", RefreshToken: "BAD"})
+	s.sky.ExpireForTest()
 	fi.favorites = append(fi.favorites, asset("b", "image/jpeg", "IMAGE"))
 	if err := s.Once(ctx); err != nil {
 		t.Fatal(err)
@@ -383,5 +412,28 @@ func TestSelectFrames(t *testing.T) {
 	}
 	if _, err := selectFrames(all, nil, []string{"Nope"}); err == nil {
 		t.Error("unknown name should error")
+	}
+}
+
+func TestReauthOn401(t *testing.T) {
+	fi, fs, cfg, st := setup(t, nil)
+	fi.favorites = []map[string]any{asset("a", "image/jpeg", "IMAGE")}
+	ctx := context.Background()
+	s, err := newSyncer(t, cfg, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Revoke the token the client currently holds (issued at login: "A1").
+	fs.mu.Lock()
+	fs.revoked = "A1"
+	fs.mu.Unlock()
+	if err := s.Once(ctx); err != nil {
+		t.Fatalf("Once after revocation: %v", err)
+	}
+	if len(fs.uploads) != 1 {
+		t.Errorf("expected upload to succeed after re-auth; uploads=%d", len(fs.uploads))
+	}
+	if fs.refresh == 0 {
+		t.Errorf("expected a token refresh after 401")
 	}
 }

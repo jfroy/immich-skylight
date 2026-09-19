@@ -7,60 +7,105 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/jfroy/immich-skylight/internal/config"
+	"github.com/jfroy/immich-skylight/internal/httpx"
 	"github.com/jfroy/immich-skylight/internal/immich"
+	"github.com/jfroy/immich-skylight/internal/metrics"
 	"github.com/jfroy/immich-skylight/internal/skylight"
 	"github.com/jfroy/immich-skylight/internal/state"
 )
 
+var tracer = otel.Tracer("github.com/jfroy/immich-skylight/internal/sync")
+
 // Syncer coordinates one or more sync passes.
 type Syncer struct {
-	cfg   *config.Config
-	im    *immich.Client
-	sky   *skylight.Client
-	st    *state.State
-	log   *slog.Logger
-	tags  []string // resolved Immich tag IDs
-	frame []string // resolved Skylight frame IDs
+	cfg    *config.Config
+	im     *immich.Client
+	sky    *skylight.Client
+	st     *state.State
+	log    *slog.Logger
+	rec    *metrics.Recorder
+	tags   []string // resolved Immich tag IDs
+	frames []string // resolved Skylight frame IDs
+
+	ready atomic.Bool
+}
+
+// Options for New.
+type Options struct {
+	Config  *config.Config
+	State   *state.State
+	Logger  *slog.Logger
+	Metrics *metrics.Recorder
+	// SkylightBaseURL overrides the Skylight API base (tests).
+	SkylightBaseURL string
 }
 
 // New wires up clients and resolves tags and frames. It fails fast on bad
 // credentials or unknown tag/frame names.
-func New(ctx context.Context, cfg *config.Config, st *state.State, log *slog.Logger) (*Syncer, error) {
-	s := &Syncer{cfg: cfg, st: st, log: log}
-	s.im = immich.New(cfg.ImmichURL, cfg.ImmichAPIKey)
-	s.sky = skylight.NewClient(cfg.SkylightEmail, cfg.SkylightPassword, st.Fingerprint, &tokenStore{st})
+func New(ctx context.Context, o Options) (*Syncer, error) {
+	ctx, span := tracer.Start(ctx, "sync.Setup")
+	defer span.End()
 
-	if err := s.im.Ping(ctx); err != nil {
-		return nil, err
-	}
-	tags, err := s.im.ResolveTags(ctx, cfg.Tags)
+	cfg := o.Config
+	s := &Syncer{cfg: cfg, st: o.State, log: o.Logger, rec: o.Metrics}
+
+	imHTTP := httpx.NewClient(o.Metrics, func(*http.Request) string { return "immich" }, 5*time.Minute)
+	s.im = immich.New(cfg.ImmichURL, cfg.ImmichAPIKey, imHTTP)
+
+	skyHTTP := httpx.NewClient(o.Metrics, nil, 5*time.Minute)
+	var err error
+	s.sky, err = skylight.New(skylight.Options{
+		Email:       cfg.SkylightEmail,
+		Password:    cfg.SkylightPassword,
+		Fingerprint: o.State.Fingerprint,
+		Store:       &tokenStore{o.State},
+		HTTPClient:  skyHTTP,
+		Logger:      o.Logger,
+		Metrics:     o.Metrics,
+		BaseURL:     o.SkylightBaseURL,
+	})
 	if err != nil {
 		return nil, err
 	}
-	s.tags = tags
 
+	if err := s.im.Ping(ctx); err != nil {
+		return nil, fail(span, err)
+	}
+	if s.tags, err = s.im.ResolveTags(ctx, cfg.Tags); err != nil {
+		return nil, fail(span, err)
+	}
 	if err := s.sky.Authenticate(ctx); err != nil {
-		return nil, fmt.Errorf("skylight login: %w", err)
+		return nil, fail(span, err)
 	}
 	frames, err := s.sky.Frames(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("listing skylight frames: %w", err)
+		return nil, fail(span, fmt.Errorf("listing skylight frames: %w", err))
 	}
-	s.frame, err = selectFrames(frames, cfg.FrameIDs, cfg.FrameNames)
-	if err != nil {
-		return nil, err
+	if s.frames, err = selectFrames(frames, cfg.FrameIDs, cfg.FrameNames); err != nil {
+		return nil, fail(span, err)
 	}
 	for _, f := range frames {
-		if contains(s.frame, f.ID) {
-			log.Info("target frame", "id", f.ID, "name", f.Name)
+		if contains(s.frames, f.ID) {
+			s.log.Info("target frame", "id", f.ID, "name", f.Name)
 		}
 	}
+	s.ready.Store(true)
 	return s, nil
 }
+
+// Ready reports whether setup completed (used by the readiness probe).
+func (s *Syncer) Ready() bool { return s != nil && s.ready.Load() }
 
 // Run performs sync passes until ctx is cancelled.
 func (s *Syncer) Run(ctx context.Context) error {
@@ -79,8 +124,23 @@ func (s *Syncer) Run(ctx context.Context) error {
 }
 
 // Once performs a single sync pass.
-func (s *Syncer) Once(ctx context.Context) error {
+func (s *Syncer) Once(ctx context.Context) (err error) {
+	ctx, span := tracer.Start(ctx, "sync.Pass", trace.WithNewRoot())
 	start := time.Now()
+	selected := 0
+	defer func() {
+		result := "success"
+		if err != nil {
+			result = "failure"
+			fail(span, err)
+		}
+		if s.rec != nil {
+			s.rec.SyncFinished(ctx, result, time.Since(start), selected, s.st.Count())
+		}
+		span.End()
+	}()
+	log := s.log.With("trace_id", span.SpanContext().TraceID().String())
+
 	assets, err := s.im.Search(ctx, immich.SearchOptions{
 		Favorites:    s.cfg.Favorites,
 		TagIDs:       s.tags,
@@ -89,29 +149,28 @@ func (s *Syncer) Once(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	selected = len(assets)
 
-	selected := make(map[string]bool, len(assets))
+	sel := make(map[string]bool, len(assets))
 	var pending []immich.Asset
 	for _, a := range assets {
-		selected[a.ID] = true
-		if _, ok := s.st.Sent[a.ID]; !ok {
+		sel[a.ID] = true
+		if !s.st.Has(a.ID) {
 			pending = append(pending, a)
 		}
 	}
-	s.log.Info("sync pass", "selected", len(assets), "already_sent", len(assets)-len(pending), "pending", len(pending))
+	span.SetAttributes(attribute.Int("selected", len(assets)), attribute.Int("pending", len(pending)))
+	log.InfoContext(ctx, "sync pass", "selected", len(assets), "already_sent", len(assets)-len(pending), "pending", len(pending))
 
 	var sent, failed int
-	for i := len(pending) - 1; i >= 0; i-- { // oldest first so the frame shows them chronologically
+	for i := len(pending) - 1; i >= 0; i-- { // oldest first so the frame stays chronological
 		a := pending[i]
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		if err := s.upload(ctx, a); err != nil {
 			failed++
-			s.log.Warn("upload failed", "asset", a.ID, "file", a.OriginalFileName, "err", err)
-			if errors.Is(err, skylight.ErrUnauthorized) {
-				return err
-			}
+			log.WarnContext(ctx, "upload failed", "asset", a.ID, "file", a.OriginalFileName, "err", err)
 			continue
 		}
 		sent++
@@ -122,44 +181,63 @@ func (s *Syncer) Once(ctx context.Context) error {
 
 	var removed int
 	if s.cfg.RemoveUnselected {
-		removed = s.removeUnselected(ctx, selected)
+		removed = s.removeUnselected(ctx, sel)
 	}
 
-	s.log.Info("sync pass done", "sent", sent, "failed", failed, "removed", removed, "took", time.Since(start).Round(time.Millisecond))
-	return s.st.Save()
-}
-
-func (s *Syncer) upload(ctx context.Context, a immich.Asset) error {
-	data, mime, ext, err := s.fetch(ctx, a)
-	if err != nil {
+	span.SetAttributes(attribute.Int("sent", sent), attribute.Int("failed", failed), attribute.Int("removed", removed))
+	log.InfoContext(ctx, "sync pass done", "sent", sent, "failed", failed, "removed", removed, "took", time.Since(start).Round(time.Millisecond))
+	if err := s.st.Save(); err != nil {
 		return err
 	}
+	if failed > 0 && sent == 0 && len(pending) > 0 {
+		return fmt.Errorf("all %d uploads failed", failed)
+	}
+	return nil
+}
+
+func (s *Syncer) upload(ctx context.Context, a immich.Asset) (err error) {
+	ctx, span := tracer.Start(ctx, "sync.UploadAsset", trace.WithAttributes(
+		attribute.String("asset_id", a.ID), attribute.String("file", a.OriginalFileName)))
+	defer func() { fail(span, err); span.End() }()
+
+	data, ext, rendition, err := s.fetch(ctx, a)
+	if err != nil {
+		s.record(ctx, "fetch_failed", rendition, 0)
+		return err
+	}
+	span.SetAttributes(attribute.String("rendition", rendition), attribute.String("ext", ext), attribute.Int("bytes", len(data)))
+
 	caption := ""
 	if s.cfg.UseCaption && a.ExifInfo != nil {
 		caption = strings.TrimSpace(a.ExifInfo.Description)
 	}
 
 	if s.cfg.DryRun {
-		s.log.Info("dry-run: would upload", "asset", a.ID, "file", a.OriginalFileName, "ext", ext, "bytes", len(data), "caption", caption)
+		s.log.InfoContext(ctx, "dry-run: would upload", "asset", a.ID, "file", a.OriginalFileName, "ext", ext, "bytes", len(data), "caption", caption)
+		s.record(ctx, "dry_run", rendition, len(data))
 		return nil
 	}
-	res, err := s.sky.Upload(ctx, s.frame, ext, mime, data, caption)
+	results, err := s.sky.Upload(ctx, s.frames, ext, data, caption)
+	if len(results) > 0 {
+		// Persist whatever landed so partial multi-frame uploads are not repeated.
+		rec := state.Sent{Messages: map[string][]int{}, Checksum: a.Checksum, SentAt: time.Now()}
+		for _, r := range results {
+			rec.Messages[r.FrameID] = r.MessageIDs
+		}
+		s.st.MarkSent(a.ID, rec)
+	}
 	if err != nil {
+		s.record(ctx, "upload_failed", rendition, len(data))
 		return err
 	}
-	s.st.MarkSent(a.ID, state.Sent{
-		MessageIDs: res.MessageIDs,
-		FrameIDs:   s.frame,
-		Checksum:   a.Checksum,
-		SentAt:     time.Now(),
-	})
-	s.log.Info("uploaded", "asset", a.ID, "file", a.OriginalFileName, "ext", ext, "bytes", len(data), "message_ids", res.MessageIDs)
+	s.record(ctx, "success", rendition, len(data))
+	s.log.InfoContext(ctx, "uploaded", "asset", a.ID, "file", a.OriginalFileName, "ext", ext, "bytes", len(data), "frames", len(results))
 	return nil
 }
 
 // fetch downloads the configured rendition, falling back to Immich's preview
 // when the original/fullsize is unavailable or not a format Skylight accepts.
-func (s *Syncer) fetch(ctx context.Context, a immich.Asset) (data []byte, mime, ext string, err error) {
+func (s *Syncer) fetch(ctx context.Context, a immich.Asset) (data []byte, ext, rendition string, err error) {
 	var chain []immich.Rendition
 	switch s.cfg.ImageSource {
 	case config.SourceOriginal:
@@ -169,17 +247,18 @@ func (s *Syncer) fetch(ctx context.Context, a immich.Asset) (data []byte, mime, 
 	default:
 		chain = []immich.Rendition{immich.RenditionPreview}
 	}
-	// Videos only exist as originals on Skylight's side of things.
 	if a.Type == "VIDEO" {
 		chain = []immich.Rendition{immich.RenditionOriginal}
 	}
 
 	var lastErr error
 	for _, r := range chain {
+		rendition = string(r)
 		if r == immich.RenditionOriginal && skylight.SupportedExt(a.OriginalMimeType) == "" {
 			lastErr = fmt.Errorf("original type %s not supported by skylight", a.OriginalMimeType)
 			continue
 		}
+		var mime string
 		data, mime, err = s.im.Download(ctx, a.ID, r)
 		if err != nil {
 			lastErr = fmt.Errorf("download %s: %w", r, err)
@@ -189,51 +268,59 @@ func (s *Syncer) fetch(ctx context.Context, a immich.Asset) (data []byte, mime, 
 			lastErr = fmt.Errorf("rendition %s has unsupported type %q", r, mime)
 			continue
 		}
-		return data, mime, ext, nil
+		return data, ext, rendition, nil
 	}
-	return nil, "", "", lastErr
+	return nil, "", rendition, lastErr
 }
 
 // removeUnselected deletes photos from the frame that are no longer selected
 // in Immich (un-favorited / untagged / deleted).
 func (s *Syncer) removeUnselected(ctx context.Context, selected map[string]bool) int {
+	ctx, span := tracer.Start(ctx, "sync.RemoveUnselected")
+	defer span.End()
+
 	byFrame := map[string][]int{}
 	var stale []string
-	for id, rec := range s.st.Sent {
+	for id, rec := range s.st.Snapshot() {
 		if selected[id] {
 			continue
 		}
 		stale = append(stale, id)
-		frames := rec.FrameIDs
-		if len(frames) == 0 {
-			frames = s.frame
-		}
-		// One message ID is returned per target frame, in order.
-		for i, mid := range rec.MessageIDs {
-			f := frames[0]
-			if i < len(frames) {
-				f = frames[i]
-			}
-			byFrame[f] = append(byFrame[f], mid)
+		for f, ids := range rec.Messages {
+			byFrame[f] = append(byFrame[f], ids...)
 		}
 	}
+	span.SetAttributes(attribute.Int("stale", len(stale)))
 	if len(stale) == 0 {
 		return 0
 	}
 	if s.cfg.DryRun {
-		s.log.Info("dry-run: would remove", "assets", len(stale))
+		s.log.InfoContext(ctx, "dry-run: would remove", "assets", len(stale))
 		return 0
 	}
 	for f, ids := range byFrame {
-		if err := s.sky.DeleteMessages(ctx, f, ids); err != nil {
-			s.log.Warn("removing photos from frame failed", "frame", f, "count", len(ids), "err", err)
+		if err := s.sky.Delete(ctx, f, ids); err != nil {
+			s.log.WarnContext(ctx, "removing photos from frame failed", "frame", f, "count", len(ids), "err", err)
+			if s.rec != nil {
+				s.rec.Removed(ctx, "failure", len(ids))
+			}
+			fail(span, err)
 			return 0
 		}
 	}
 	for _, id := range stale {
 		s.st.Forget(id)
 	}
+	if s.rec != nil {
+		s.rec.Removed(ctx, "success", len(stale))
+	}
 	return len(stale)
+}
+
+func (s *Syncer) record(ctx context.Context, result, rendition string, n int) {
+	if s.rec != nil {
+		s.rec.Upload(ctx, result, rendition, n)
+	}
 }
 
 func selectFrames(all []skylight.Frame, ids, names []string) ([]string, error) {
@@ -285,11 +372,19 @@ func contains(xs []string, x string) bool {
 	return false
 }
 
+func fail(span trace.Span, err error) error {
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return err
+}
+
 // tokenStore adapts state.State to skylight.TokenStore.
 type tokenStore struct{ st *state.State }
 
 func (t *tokenStore) Tokens() (string, string, time.Time) {
-	tk := t.st.Tokens
+	tk := t.st.GetTokens()
 	return tk.AccessToken, tk.RefreshToken, tk.Expiry
 }
 

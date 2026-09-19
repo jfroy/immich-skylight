@@ -1,0 +1,103 @@
+---
+# yaml-language-server: $schema=https://raw.githubusercontent.com/bjw-s-labs/helm-charts/refs/heads/main/charts/other/app-template/schemas/helmrelease-helm-v2.schema.json
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: immich-skylight
+spec:
+  interval: 1h
+  chartRef:
+    kind: OCIRepository
+    name: app-template
+    namespace: flux-system
+  values:
+    controllers:
+      immich-skylight:
+        annotations:
+          reloader.stakater.com/auto: "true"
+        strategy: Recreate # single writer on the state PVC
+        containers:
+          immich-skylight:
+            image:
+              repository: ghcr.io/jfroy/immich-skylight
+              tag: latest # pin to <version>@sha256:<digest> once released
+            args: [run]
+            env:
+              IMMICH_URL: http://immich-server.default.svc.cluster.local:2283
+              IMMICH_FAVORITES: "true"
+              IMMICH_TAGS: Skylight
+              IMMICH_IMAGE_SOURCE: preview
+              REMOVE_UNSELECTED: "false"
+              SYNC_INTERVAL: 15m
+              STATE_FILE: /data/state.json
+              HTTP_ADDR: :8080
+              LOG_LEVEL: info
+              TZ: America/Los_Angeles
+              OTEL_SERVICE_NAME: immich-skylight
+              # Uncomment to ship traces/metrics/logs over OTLP; Prometheus scraping works regardless.
+              # OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector.observability.svc.cluster.local:4318
+              # OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+            envFrom:
+              - secretRef:
+                  name: immich-skylight
+            probes:
+              liveness:
+                enabled: true
+                custom: true
+                spec:
+                  httpGet:
+                    path: /healthz
+                    port: &httpPort 8080
+              readiness:
+                enabled: true
+                custom: true
+                spec:
+                  httpGet:
+                    path: /readyz
+                    port: *httpPort
+                  initialDelaySeconds: 5
+                  periodSeconds: 10
+                  failureThreshold: 6
+            resources:
+              requests:
+                cpu: 10m
+                memory: 64Mi
+              limits:
+                memory: 512Mi
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities: { drop: ["ALL"] }
+              readOnlyRootFilesystem: true
+              runAsNonRoot: true
+        pod:
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            fsGroupChangePolicy: OnRootMismatch
+            seccompProfile:
+              type: RuntimeDefault
+    persistence:
+      data:
+        type: persistentVolumeClaim
+        accessMode: ReadWriteOnce
+        storageClass: ceph-block
+        size: 1Gi
+        globalMounts:
+          - path: /data
+    service:
+      immich-skylight:
+        controller: immich-skylight
+        ports:
+          http:
+            port: *httpPort
+    serviceMonitor:
+      immich-skylight:
+        serviceName: immich-skylight
+        endpoints:
+          - port: http
+            scheme: http
+            path: /metrics
+            interval: 1m

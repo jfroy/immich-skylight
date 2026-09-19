@@ -12,7 +12,14 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
+
+var tracer = otel.Tracer("github.com/jfroy/immich-skylight/internal/immich")
 
 // Client talks to an Immich server using an API key.
 type Client struct {
@@ -22,11 +29,15 @@ type Client struct {
 }
 
 // New creates a client. baseURL is the server root (e.g. https://photos.example.com).
-func New(baseURL, apiKey string) *Client {
+// hc may be nil, in which case a default client is used.
+func New(baseURL, apiKey string, hc *http.Client) *Client {
+	if hc == nil {
+		hc = &http.Client{Timeout: 5 * time.Minute}
+	}
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		apiKey:  apiKey,
-		http:    &http.Client{Timeout: 5 * time.Minute},
+		http:    hc,
 	}
 }
 
@@ -115,7 +126,14 @@ type SearchOptions struct {
 }
 
 // Search returns the union of favorite assets and tagged assets, de-duplicated by ID.
-func (c *Client) Search(ctx context.Context, opts SearchOptions) ([]Asset, error) {
+func (c *Client) Search(ctx context.Context, opts SearchOptions) (assets []Asset, err error) {
+	ctx, span := tracer.Start(ctx, "immich.Search", trace.WithAttributes(
+		attribute.Bool("favorites", opts.Favorites), attribute.Int("tag_count", len(opts.TagIDs))))
+	defer func() {
+		span.SetAttributes(attribute.Int("result_count", len(assets)))
+		recordErr(span, err)
+		span.End()
+	}()
 	seen := map[string]bool{}
 	var out []Asset
 	add := func(assets []Asset) {
@@ -182,7 +200,14 @@ func (c *Client) searchAll(ctx context.Context, filter map[string]any) ([]Asset,
 
 // Download fetches the given rendition. It returns the bytes and the
 // Content-Type reported by the server.
-func (c *Client) Download(ctx context.Context, id string, r Rendition) ([]byte, string, error) {
+func (c *Client) Download(ctx context.Context, id string, r Rendition) (data []byte, mime string, err error) {
+	ctx, span := tracer.Start(ctx, "immich.Download", trace.WithAttributes(
+		attribute.String("asset_id", id), attribute.String("rendition", string(r))))
+	defer func() {
+		span.SetAttributes(attribute.Int("bytes", len(data)), attribute.String("content_type", mime))
+		recordErr(span, err)
+		span.End()
+	}()
 	var path string
 	if r == RenditionOriginal {
 		path = "/api/assets/" + url.PathEscape(id) + "/original"
@@ -203,7 +228,7 @@ func (c *Client) Download(ctx context.Context, id string, r Rendition) ([]byte, 
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, "", &HTTPError{Status: resp.StatusCode, Body: string(b)}
 	}
-	data, err := io.ReadAll(resp.Body)
+	data, err = io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, "", err
 	}
@@ -272,4 +297,11 @@ func (c *Client) doJSON(req *http.Request, out any) error {
 		return nil
 	}
 	return json.Unmarshal(body, out)
+}
+
+func recordErr(span trace.Span, err error) {
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
 }
