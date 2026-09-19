@@ -37,7 +37,7 @@ Un-favorite it → optionally removed from the frame.
 > tracks the private app API; when Skylight changes something, bump that dependency.
 > Use against your own account only.
 
-## Quick start (Kubernetes)
+## Container image
 
 Images are published to `ghcr.io/jfroy/immich-skylight` for `linux/amd64` and
 `linux/arm64`, built from distroless `static:nonroot`, signed with cosign (keyless),
@@ -48,6 +48,38 @@ cosign verify ghcr.io/jfroy/immich-skylight:latest \
   --certificate-identity-regexp='^https://github.com/jfroy/immich-skylight/' \
   --certificate-oidc-issuer=https://token.actions.githubusercontent.com
 ```
+
+## Choosing a frame (optional)
+
+**If your Skylight account has exactly one frame, skip this** — it is selected
+automatically. With several frames you must tell the daemon which to target, either by
+name (`SKYLIGHT_FRAME_NAMES=Kitchen`) or by ID (`SKYLIGHT_FRAME_IDS=1234567`). Frame
+names are what you see in the Skylight app; to list names and IDs, run the `frames`
+command once with just your Skylight credentials. It makes no changes to your account.
+
+With a container runtime (Docker or Podman):
+
+```bash
+docker run --rm \
+  -e SKYLIGHT_EMAIL=you@example.com -e SKYLIGHT_PASSWORD=... \
+  -e STATE_FILE=/tmp/state.db \
+  ghcr.io/jfroy/immich-skylight:latest frames
+```
+
+Or straight from a checkout with Go:
+
+```bash
+SKYLIGHT_EMAIL=you@example.com SKYLIGHT_PASSWORD=... STATE_FILE=/tmp/state.db \
+  go run ./cmd/immich-skylight frames
+```
+
+```
+ID           NAME
+1234567      Kitchen
+2345678      Office
+```
+
+## Deploying with Kubernetes
 
 `deploy/kubernetes/immich-skylight.yaml` contains a Deployment, PVC and Service.
 Configuration is plain environment variables; secrets come from a Secret via
@@ -61,39 +93,32 @@ kubectl create secret generic immich-skylight \
 kubectl apply -f deploy/kubernetes/immich-skylight.yaml
 ```
 
+Edit the `env` block in the manifest for `IMMICH_URL`, selection (`IMMICH_FAVORITES`,
+`IMMICH_TAGS`) and, if needed, `SKYLIGHT_FRAME_NAMES`/`SKYLIGHT_FRAME_IDS`.
+
 The pod runs as non-root (uid 65532) with a read-only root filesystem, all capabilities
 dropped, `RuntimeDefault` seccomp, no service-account token, and a `ReadWriteOnce` PVC at
 `/data` for `state.db` — the only path the process ever writes. Use a block/filesystem
 storage class rather than NFS (SQLite WAL over NFS is unreliable). If you run the
 Prometheus Operator, add a `ServiceMonitor` on the `http` port at `/metrics`.
 
-Find your frame ID once with a one-off pod using `frames`:
-
-```bash
-kubectl run -it --rm skylight-frames --restart=Never \
-  --image=ghcr.io/jfroy/immich-skylight:latest \
-  --overrides='{"spec":{"containers":[{"name":"skylight-frames","image":"ghcr.io/jfroy/immich-skylight:latest","args":["frames"],"envFrom":[{"secretRef":{"name":"immich-skylight"}}],"env":[{"name":"STATE_FILE","value":"/tmp/state.db"}]}]}}'
-```
-
-## Quick start (Docker Compose)
+## Deploying with Docker Compose
 
 ```bash
 cd deploy/compose
-cp .env.example .env && $EDITOR .env          # IMMICH_URL, IMMICH_API_KEY, SKYLIGHT_EMAIL, SKYLIGHT_PASSWORD
-docker compose run --rm immich-skylight frames
-DRY_RUN=true docker compose run --rm immich-skylight sync
+cp .env.example .env && $EDITOR .env          # IMMICH_URL, IMMICH_API_KEY, SKYLIGHT_EMAIL, SKYLIGHT_PASSWORD, frame selection
+DRY_RUN=true docker compose run --rm immich-skylight sync   # preview what would be sent
 docker compose up -d && docker compose logs -f
 ```
 
 `deploy/compose/compose.yaml` applies the same hardening (non-root, read-only rootfs,
 no capabilities, `no-new-privileges`) and keeps `state.db` in a named volume.
 
-## Quick start (local binary)
+## Running the binary directly
 
 ```bash
 cp .env.example .env && $EDITOR .env
 make build
-make run ARGS=frames    # list frames
 make run ARGS=sync      # one-shot, DRY_RUN=true to preview
 make run                # daemon
 
@@ -114,8 +139,8 @@ All configuration is via environment variables.
 | `IMMICH_IMAGE_SOURCE` | `preview` | `preview` (~1440px JPEG), `fullsize`, or `original`. Falls back down the chain if unavailable/unsupported. |
 | `INCLUDE_VIDEOS` | `false` | Also send MP4/MOV originals. |
 | `SKYLIGHT_EMAIL` / `SKYLIGHT_PASSWORD` | — | Your Skylight account. **Required.** |
-| `SKYLIGHT_FRAME_IDS` | — | Comma-separated frame IDs. Auto-selected if the account has exactly one frame. |
-| `SKYLIGHT_FRAME_NAMES` | — | Alternative to IDs; case-insensitive match on the frame name. |
+| `SKYLIGHT_FRAME_IDS` | — | Comma-separated frame IDs. Optional: with exactly one frame on the account it is selected automatically. See [Choosing a frame](#choosing-a-frame-optional). |
+| `SKYLIGHT_FRAME_NAMES` | — | Alternative to IDs; case-insensitive match on the frame name as shown in the Skylight app. |
 | `SKYLIGHT_CAPTION` | `true` | Use the Immich description as the photo caption. |
 | `REMOVE_UNSELECTED` | `false` | Delete photos from the frame when they stop being selected in Immich. |
 | `SYNC_INTERVAL` | `15m` | Poll interval for `run`. |
@@ -161,7 +186,7 @@ Either `IMMICH_FAVORITES=true` or at least one `IMMICH_TAGS` entry must be set.
 |---|---|
 | `run` | Daemon: sync every `SYNC_INTERVAL` until SIGINT/SIGTERM. |
 | `sync` | Single pass, then exit (for cron). |
-| `frames` | Log in and print frame IDs/names. Only needs `SKYLIGHT_EMAIL`/`SKYLIGHT_PASSWORD`. |
+| `frames` | Log in and print frame IDs/names. Only needs `SKYLIGHT_EMAIL`/`SKYLIGHT_PASSWORD`; read-only. |
 | `version` | Print version/commit/date. |
 
 ## Notes
