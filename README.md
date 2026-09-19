@@ -220,3 +220,7 @@ CI (`.github/workflows`): `ci.yaml` runs vet/test/build on PRs and main; `image.
 builds multi-arch on every push to main (and PRs, without pushing), pushes to GHCR with
 provenance + SBOM and signs with cosign; `release.yaml` does the same for `v*` tags with
 semver tags.
+
+## License
+
+[Apache-2.0](LICENSE)
