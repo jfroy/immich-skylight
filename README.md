@@ -49,30 +49,46 @@ cosign verify ghcr.io/jfroy/immich-skylight:latest \
   --certificate-oidc-issuer=https://token.actions.githubusercontent.com
 ```
 
-Two deployment flavours are included:
-
-- `deploy/flatops/` — Flux `HelmRelease` on bjw-s `app-template` + `ExternalSecret`,
-  matching the [flatops](https://github.com/jfroy/flatops) layout. Drop
-  `deploy/flatops/immich/skylight/` into `kubernetes/apps/default/immich/` and append
-  `deploy/flatops/immich/ks.yaml` to the existing `ks.yaml`. Populate the `immich-skylight`
-  secret in OpenBao with `immich_api_key`, `skylight_email`, `skylight_password`.
-- `deploy/kubernetes.yaml` — plain Deployment/PVC/Service for any cluster.
-
-Both run with `runAsNonRoot` (uid 65532), `readOnlyRootFilesystem`, all capabilities
-dropped, `RuntimeDefault` seccomp, no service-account token, and a 1 Gi PVC at `/data`
-for `state.db` — the only path the process ever writes. Secrets are plain env vars via
-`envFrom.secretRef`.
-
-Find your frame ID once with a one-off pod (or locally) using `frames`:
+`deploy/kubernetes/immich-skylight.yaml` contains a Deployment, PVC and Service.
+Configuration is plain environment variables; secrets come from a Secret via
+`envFrom.secretRef`:
 
 ```bash
-kubectl -n default run -it --rm skylight-frames --restart=Never \
+kubectl create secret generic immich-skylight \
+  --from-literal=IMMICH_API_KEY=... \
+  --from-literal=SKYLIGHT_EMAIL=... \
+  --from-literal=SKYLIGHT_PASSWORD=...
+kubectl apply -f deploy/kubernetes/immich-skylight.yaml
+```
+
+The pod runs as non-root (uid 65532) with a read-only root filesystem, all capabilities
+dropped, `RuntimeDefault` seccomp, no service-account token, and a `ReadWriteOnce` PVC at
+`/data` for `state.db` — the only path the process ever writes. Use a block/filesystem
+storage class rather than NFS (SQLite WAL over NFS is unreliable). If you run the
+Prometheus Operator, add a `ServiceMonitor` on the `http` port at `/metrics`.
+
+Find your frame ID once with a one-off pod using `frames`:
+
+```bash
+kubectl run -it --rm skylight-frames --restart=Never \
   --image=ghcr.io/jfroy/immich-skylight:latest \
-  --env STATE_FILE=/tmp/state.db \
   --overrides='{"spec":{"containers":[{"name":"skylight-frames","image":"ghcr.io/jfroy/immich-skylight:latest","args":["frames"],"envFrom":[{"secretRef":{"name":"immich-skylight"}}],"env":[{"name":"STATE_FILE","value":"/tmp/state.db"}]}]}}'
 ```
 
-## Quick start (local binary / Docker)
+## Quick start (Docker Compose)
+
+```bash
+cd deploy/compose
+cp .env.example .env && $EDITOR .env          # IMMICH_URL, IMMICH_API_KEY, SKYLIGHT_EMAIL, SKYLIGHT_PASSWORD
+docker compose run --rm immich-skylight frames
+DRY_RUN=true docker compose run --rm immich-skylight sync
+docker compose up -d && docker compose logs -f
+```
+
+`deploy/compose/compose.yaml` applies the same hardening (non-root, read-only rootfs,
+no capabilities, `no-new-privileges`) and keeps `state.db` in a named volume.
+
+## Quick start (local binary)
 
 ```bash
 cp .env.example .env && $EDITOR .env

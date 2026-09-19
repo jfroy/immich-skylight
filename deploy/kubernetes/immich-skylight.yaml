@@ -1,7 +1,7 @@
 ---
-# Plain-Kubernetes equivalent of deploy/flatops (no Flux / app-template).
+# Plain Kubernetes deployment (Deployment + PVC + Service).
 # Create the Secret first:
-#   kubectl -n default create secret generic immich-skylight \
+#   kubectl create secret generic immich-skylight \
 #     --from-literal=IMMICH_API_KEY=... --from-literal=SKYLIGHT_EMAIL=... --from-literal=SKYLIGHT_PASSWORD=...
 apiVersion: v1
 kind: PersistentVolumeClaim
