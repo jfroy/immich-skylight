@@ -3,6 +3,7 @@ module github.com/jfroy/immich-skylight
 go 1.27.0
 
 require (
+	github.com/golang-migrate/migrate/v4 v4.20.1
 	github.com/prometheus/client_golang v1.24.1
 	github.com/sebrandon1/go-skylight v0.2.2-0.20260909133450-e6732d31fe8c
 	go.opentelemetry.io/contrib/bridges/otelslog v0.20.1

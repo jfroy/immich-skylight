@@ -18,3 +18,12 @@ docker-multiarch:
 	  --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg DATE=$(DATE) .
 run: build
 	set -a; . ./.env; set +a; STATE_FILE=$${STATE_FILE:-./data/state.json} ./bin/immich-skylight $(ARGS)
+
+# Create a new migration pair: make migration NAME=add_widgets
+MIGRATIONS_DIR = migrations/sqlite
+.PHONY: migration
+migration:
+	@test -n "$(NAME)" || { echo "usage: make migration NAME=description"; exit 1; }
+	@next=$$(printf '%06d' $$(( $$(ls $(MIGRATIONS_DIR)/*.up.sql 2>/dev/null | wc -l) + 1 ))); \
+	 for d in up down; do f="$(MIGRATIONS_DIR)/$${next}_$(NAME).$$d.sql"; \
+	   printf -- "-- %s: %s\n" "$$d" "$(NAME)" > "$$f"; echo "created $$f"; done

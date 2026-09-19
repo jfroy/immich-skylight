@@ -108,6 +108,7 @@ func run(ctx context.Context, cmd string) error {
 		return err
 	}
 	defer st.Close()
+	log.Info("state opened", "path", cfg.StateFile, "schema_version", st.SchemaVersion)
 
 	if cmd == "frames" {
 		return listFrames(ctx, cfg, st, log, rec)

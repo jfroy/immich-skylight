@@ -154,9 +154,9 @@ Either `IMMICH_FAVORITES=true` or at least one `IMMICH_TAGS` entry must be set.
 - Assets already on the frame before you started using this tool are unknown to it and
   never touched.
 - `state.db` contains your Skylight refresh token. Treat it as a secret.
-- Upgrading from the JSON state file: on first start with an empty database, a legacy
-  `state.json` next to it (or `STATE_FILE` with `.json` swapped in) is imported and
-  renamed `*.imported`.
+- Schema changes are versioned SQL migrations in `migrations/sqlite/` (golang-migrate,
+  embedded in the binary) and are applied automatically at startup. The version in
+  effect is logged as `schema_version`.
 - If Skylight changes its login flow, `frames`/`run` will fail at "skylight login";
   check for a newer [go-skylight](https://github.com/sebrandon1/go-skylight) and bump it
   (`go get github.com/sebrandon1/go-skylight@main`). Renovate is configured to propose this.
@@ -166,8 +166,14 @@ Either `IMMICH_FAVORITES=true` or at least one `IMMICH_TAGS` entry must be set.
 ## Development
 
 ```bash
-make lint test          # vet, gofmt, race tests against fake Immich + Skylight servers
+make lint test                    # vet, gofmt, race tests against fake Immich + Skylight servers
+make migration NAME=add_widgets   # scaffold migrations/sqlite/00000N_add_widgets.{up,down}.sql
 ```
+
+Migrations use [golang-migrate](https://github.com/golang-migrate/migrate) with the
+`iofs` source (files embedded via `migrations/embed.go`) and its cgo-free sqlite driver.
+`Open` runs `Up` and refuses to start on a dirty version. Down files exist for authoring
+and manual rollback with the `migrate` CLI; the daemon never runs them.
 
 CI (`.github/workflows`): `ci.yaml` runs vet/test/build on PRs and main; `image.yaml`
 builds multi-arch on every push to main (and PRs, without pushing), pushes to GHCR with

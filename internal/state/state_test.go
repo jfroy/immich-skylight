@@ -2,7 +2,6 @@ package state
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -65,87 +64,26 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
-func TestImportLegacyV2(t *testing.T) {
+func TestMigrationsIdempotent(t *testing.T) {
 	ctx := context.Background()
-	dir := t.TempDir()
-	legacy := filepath.Join(dir, "state.json")
-	if err := os.WriteFile(legacy, []byte(`{
-	  "version": 2,
-	  "device_fingerprint": "fp-legacy",
-	  "skylight_tokens": {"access_token": "A", "refresh_token": "R", "expiry": "2030-01-01T00:00:00Z"},
-	  "sent": {"asset-1": {"messages": {"111": [5, 6]}, "checksum": "c", "sent_at": "2026-01-02T03:04:05Z"}}
-	}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	st, err := Open(ctx, filepath.Join(dir, "state.db"))
+	path := filepath.Join(t.TempDir(), "state.db")
+	st, err := Open(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
-	if st.Fingerprint != "fp-legacy" {
-		t.Errorf("fingerprint = %q", st.Fingerprint)
+	if st.SchemaVersion == 0 {
+		t.Fatal("schema version not recorded")
 	}
-	tk, _ := st.GetTokens(ctx)
-	if tk.RefreshToken != "R" || tk.Expiry.Year() != 2030 {
-		t.Errorf("tokens = %+v", tk)
-	}
-	rec, ok, _ := st.Get(ctx, "asset-1")
-	if !ok || rec.Checksum != "c" || len(rec.Messages["111"]) != 2 || rec.SentAt.Year() != 2026 {
-		t.Errorf("record = %+v ok=%v", rec, ok)
-	}
-	if _, err := os.Stat(legacy + ".imported"); err != nil {
-		t.Errorf("legacy file not renamed: %v", err)
-	}
-	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
-		t.Errorf("legacy file still present")
-	}
-}
-
-func TestImportLegacyV1(t *testing.T) {
-	ctx := context.Background()
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(`{
-	  "version": 1,
-	  "device_fingerprint": "fp1",
-	  "skylight_tokens": {},
-	  "sent": {"x": {"message_ids": [7, 8], "frame_ids": ["111", "222"], "sent_at": "2026-01-01T00:00:00Z"}}
-	}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	st, err := Open(ctx, filepath.Join(dir, "state.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	rec, ok, _ := st.Get(ctx, "x")
-	if !ok || rec.Messages["111"][0] != 7 || rec.Messages["222"][0] != 8 {
-		t.Errorf("v1 import = %+v ok=%v", rec, ok)
-	}
-}
-
-func TestNoImportWhenDBPopulated(t *testing.T) {
-	ctx := context.Background()
-	dir := t.TempDir()
-	db := filepath.Join(dir, "state.db")
-	st, err := Open(ctx, db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fp := st.Fingerprint
+	v := st.SchemaVersion
 	st.Close()
 
-	// A stray legacy file must not be imported over an initialized database.
-	_ = os.WriteFile(filepath.Join(dir, "state.json"), []byte(`{"device_fingerprint":"other","sent":{"z":{"messages":{}}}}`), 0o600)
-	st, err = Open(ctx, db)
+	// Reopening an up-to-date database must be a no-op.
+	st, err = Open(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	if st.Fingerprint != fp {
-		t.Errorf("fingerprint overwritten by legacy import")
-	}
-	if n, _ := st.Count(ctx); n != 0 {
-		t.Errorf("legacy records imported into populated db")
+	if st.SchemaVersion != v {
+		t.Errorf("version changed on reopen: %d -> %d", v, st.SchemaVersion)
 	}
 }

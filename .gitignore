@@ -2,4 +2,3 @@
 /data/
 .env
 state.db*
-state.json*

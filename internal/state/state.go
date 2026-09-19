@@ -1,21 +1,27 @@
 // Package state persists sync progress and Skylight credentials in a SQLite
 // database (pure-Go driver, no cgo). Every mutation is committed immediately,
 // so a crash mid-pass never loses or duplicates an upload record.
+//
+// The schema is managed by golang-migrate from the SQL files embedded in the
+// top-level migrations package; Open applies pending migrations.
 package state
 
 import (
 	"context"
 	"crypto/rand"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
+	"github.com/golang-migrate/migrate/v4"
+	migsqlite "github.com/golang-migrate/migrate/v4/database/sqlite"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 	_ "modernc.org/sqlite"
+
+	"github.com/jfroy/immich-skylight/migrations"
 )
 
 // Sent records an asset that has been uploaded to Skylight.
@@ -37,69 +43,42 @@ type Tokens struct {
 type State struct {
 	// Fingerprint is the stable per-installation device UUID.
 	Fingerprint string
+	// SchemaVersion is the migration version in effect after Open.
+	SchemaVersion uint
 
 	db *sql.DB
 }
 
-const schema = `
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
-PRAGMA foreign_keys = ON;
-
-CREATE TABLE IF NOT EXISTS meta (
-  key   TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS sent (
-  asset_id TEXT PRIMARY KEY,
-  checksum TEXT,
-  sent_at  TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS sent_message (
-  asset_id   TEXT    NOT NULL REFERENCES sent(asset_id) ON DELETE CASCADE,
-  frame_id   TEXT    NOT NULL,
-  message_id INTEGER NOT NULL,
-  PRIMARY KEY (asset_id, frame_id, message_id)
-);
-CREATE INDEX IF NOT EXISTS sent_message_frame ON sent_message(frame_id);
-`
-
-// Open opens (creating if needed) the database at path. If the database is
-// empty and a legacy JSON state file exists at the same path with a .json
-// extension (or next to it as state.json), it is imported once.
+// Open opens (creating if needed) the database at path and applies any
+// pending schema migrations.
 func Open(ctx context.Context, path string) (*State, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	dsn := "file:" + path + "?_pragma=busy_timeout(5000)"
+	// Pragmas are connection-scoped in modernc.org/sqlite, so set them on the
+	// DSN rather than in a migration. journal_mode is also persisted in the file.
+	dsn := "file:" + path +
+		"?_pragma=busy_timeout(5000)" +
+		"&_pragma=journal_mode(WAL)" +
+		"&_pragma=synchronous(NORMAL)" +
+		"&_pragma=foreign_keys(1)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening state db: %w", err)
 	}
-	// One connection: SQLite has a single writer, and the WAL pragma is
-	// per-connection; this keeps behavior predictable.
+	// SQLite has a single writer; one connection keeps behavior predictable.
 	db.SetMaxOpenConns(1)
-	if _, err := db.ExecContext(ctx, schema); err != nil {
+
+	version, err := Migrate(db)
+	if err != nil {
 		db.Close()
-		return nil, fmt.Errorf("initializing state schema: %w", err)
+		return nil, err
 	}
-	s := &State{db: db}
+	s := &State{db: db, SchemaVersion: version}
 
 	if s.Fingerprint, err = s.meta(ctx, "device_fingerprint"); err != nil {
 		db.Close()
 		return nil, err
-	}
-	if s.Fingerprint == "" {
-		if err := s.importLegacy(ctx, path); err != nil {
-			db.Close()
-			return nil, err
-		}
-		if s.Fingerprint, err = s.meta(ctx, "device_fingerprint"); err != nil {
-			db.Close()
-			return nil, err
-		}
 	}
 	if s.Fingerprint == "" {
 		s.Fingerprint = newUUID()
@@ -109,6 +88,34 @@ func Open(ctx context.Context, path string) (*State, error) {
 		}
 	}
 	return s, nil
+}
+
+// Migrate applies all pending up-migrations to db and returns the resulting
+// schema version.
+func Migrate(db *sql.DB) (uint, error) {
+	src, err := iofs.New(migrations.SQLite, "sqlite")
+	if err != nil {
+		return 0, fmt.Errorf("loading migrations: %w", err)
+	}
+	drv, err := migsqlite.WithInstance(db, &migsqlite.Config{MigrationsTable: "schema_migrations"})
+	if err != nil {
+		return 0, fmt.Errorf("preparing migration driver: %w", err)
+	}
+	m, err := migrate.NewWithInstance("iofs", src, "sqlite", drv)
+	if err != nil {
+		return 0, fmt.Errorf("preparing migrations: %w", err)
+	}
+	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		return 0, fmt.Errorf("applying migrations: %w", err)
+	}
+	v, dirty, err := m.Version()
+	if err != nil {
+		return 0, fmt.Errorf("reading schema version: %w", err)
+	}
+	if dirty {
+		return v, fmt.Errorf("schema is dirty at version %d; manual repair required", v)
+	}
+	return v, nil
 }
 
 // Close closes the database.
@@ -270,74 +277,6 @@ func (s *State) tx(ctx context.Context, fn func(*sql.Tx) error) error {
 		return err
 	}
 	return tx.Commit()
-}
-
-// legacyJSON is the pre-SQLite on-disk document.
-type legacyJSON struct {
-	Fingerprint string `json:"device_fingerprint"`
-	Tokens      struct {
-		AccessToken  string    `json:"access_token"`
-		RefreshToken string    `json:"refresh_token"`
-		Expiry       time.Time `json:"expiry"`
-	} `json:"skylight_tokens"`
-	Sent map[string]struct {
-		Messages   map[string][]int `json:"messages"`
-		MessageIDs []int            `json:"message_ids"` // v1 shape
-		FrameIDs   []string         `json:"frame_ids"`   // v1 shape
-		Checksum   string           `json:"checksum"`
-		SentAt     time.Time        `json:"sent_at"`
-	} `json:"sent"`
-}
-
-// importLegacy migrates a JSON state file into the (empty) database and
-// renames it to *.imported.
-func (s *State) importLegacy(ctx context.Context, dbPath string) error {
-	candidates := []string{
-		strings.TrimSuffix(dbPath, filepath.Ext(dbPath)) + ".json",
-		filepath.Join(filepath.Dir(dbPath), "state.json"),
-	}
-	for _, p := range candidates {
-		b, err := os.ReadFile(p)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("reading legacy state %s: %w", p, err)
-		}
-		var doc legacyJSON
-		if err := json.Unmarshal(b, &doc); err != nil {
-			return fmt.Errorf("parsing legacy state %s: %w", p, err)
-		}
-		if doc.Fingerprint != "" {
-			if err := s.setMeta(ctx, "device_fingerprint", doc.Fingerprint); err != nil {
-				return err
-			}
-		}
-		if err := s.SetTokens(ctx, Tokens{doc.Tokens.AccessToken, doc.Tokens.RefreshToken, doc.Tokens.Expiry}); err != nil {
-			return err
-		}
-		for id, rec := range doc.Sent {
-			msgs := rec.Messages
-			if msgs == nil {
-				msgs = map[string][]int{}
-				for i, mid := range rec.MessageIDs { // v1: one message per frame, in order
-					f := "unknown"
-					if i < len(rec.FrameIDs) {
-						f = rec.FrameIDs[i]
-					} else if len(rec.FrameIDs) > 0 {
-						f = rec.FrameIDs[0]
-					}
-					msgs[f] = append(msgs[f], mid)
-				}
-			}
-			if err := s.MarkSent(ctx, id, Sent{Messages: msgs, Checksum: rec.Checksum, SentAt: rec.SentAt}); err != nil {
-				return err
-			}
-		}
-		_ = os.Rename(p, p+".imported")
-		return nil
-	}
-	return nil
 }
 
 // newUUID returns a random RFC 4122 v4 UUID string.
