@@ -8,11 +8,18 @@ Un-favorite it → optionally removed from the frame.
 ## How it works
 
 ```
-┌────────┐  search/metadata   ┌─────────────────┐  upload_url + S3 PUT  ┌──────────┐
-│ Immich │ ─────────────────▶ │ immich-skylight │ ────────────────────▶ │ Skylight │
-│        │ ◀───────────────── │   (daemon)      │                       │  frame   │
-└────────┘  thumbnail/original└───────┬─────────┘                       └──────────┘
-                                      │ state.db (SQLite): tokens + asset → frame → message IDs
+┌────────┐   search/metadata    ┌─────────────────┐   upload_url + S3 PUT   ┌──────────┐
+│        │ ───────────────────▶ │                 │ ──────────────────────▶ │          │
+│ Immich │                      │ immich-skylight │                         │ Skylight │
+│        │ ◀─────────────────── │     (daemon)    │ ──────────────────────▶ │  frame   │
+│        │  thumbnail/original  │                 │  delete (reverse sync)  │          │
+└────────┘                      └────────┬────────┘                         └──────────┘
+                                         │
+                                ┌────────┴────────┐
+                                │    state.db     │
+                                │  tokens, asset  │
+                                │ → frame → msgs  │
+                                └─────────────────┘
 ```
 
 1. **Select** – queries Immich for favorites and/or assets carrying configured tags
