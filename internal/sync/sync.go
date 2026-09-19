@@ -135,7 +135,8 @@ func (s *Syncer) Once(ctx context.Context) (err error) {
 			fail(span, err)
 		}
 		if s.rec != nil {
-			s.rec.SyncFinished(ctx, result, time.Since(start), selected, s.st.Count())
+			tracked, _ := s.st.Count(context.WithoutCancel(ctx))
+			s.rec.SyncFinished(ctx, result, time.Since(start), selected, tracked)
 		}
 		span.End()
 	}()
@@ -153,9 +154,13 @@ func (s *Syncer) Once(ctx context.Context) (err error) {
 
 	sel := make(map[string]bool, len(assets))
 	var pending []immich.Asset
+	tracked, err := s.st.Snapshot(ctx)
+	if err != nil {
+		return fmt.Errorf("reading state: %w", err)
+	}
 	for _, a := range assets {
 		sel[a.ID] = true
-		if !s.st.Has(a.ID) {
+		if _, ok := tracked[a.ID]; !ok {
 			pending = append(pending, a)
 		}
 	}
@@ -174,21 +179,15 @@ func (s *Syncer) Once(ctx context.Context) (err error) {
 			continue
 		}
 		sent++
-		if err := s.st.Save(); err != nil {
-			return fmt.Errorf("saving state: %w", err)
-		}
 	}
 
 	var removed int
 	if s.cfg.RemoveUnselected {
-		removed = s.removeUnselected(ctx, sel)
+		removed = s.removeUnselected(ctx, sel, tracked)
 	}
 
 	span.SetAttributes(attribute.Int("sent", sent), attribute.Int("failed", failed), attribute.Int("removed", removed))
 	log.InfoContext(ctx, "sync pass done", "sent", sent, "failed", failed, "removed", removed, "took", time.Since(start).Round(time.Millisecond))
-	if err := s.st.Save(); err != nil {
-		return err
-	}
 	if failed > 0 && sent == 0 && len(pending) > 0 {
 		return fmt.Errorf("all %d uploads failed", failed)
 	}
@@ -224,7 +223,9 @@ func (s *Syncer) upload(ctx context.Context, a immich.Asset) (err error) {
 		for _, r := range results {
 			rec.Messages[r.FrameID] = r.MessageIDs
 		}
-		s.st.MarkSent(a.ID, rec)
+		if serr := s.st.MarkSent(context.WithoutCancel(ctx), a.ID, rec); serr != nil {
+			return fmt.Errorf("recording upload of %s (message ids %v): %w", a.ID, rec.Messages, errors.Join(serr, err))
+		}
 	}
 	if err != nil {
 		s.record(ctx, "upload_failed", rendition, len(data))
@@ -275,13 +276,13 @@ func (s *Syncer) fetch(ctx context.Context, a immich.Asset) (data []byte, ext, r
 
 // removeUnselected deletes photos from the frame that are no longer selected
 // in Immich (un-favorited / untagged / deleted).
-func (s *Syncer) removeUnselected(ctx context.Context, selected map[string]bool) int {
+func (s *Syncer) removeUnselected(ctx context.Context, selected map[string]bool, tracked map[string]state.Sent) int {
 	ctx, span := tracer.Start(ctx, "sync.RemoveUnselected")
 	defer span.End()
 
 	byFrame := map[string][]int{}
 	var stale []string
-	for id, rec := range s.st.Snapshot() {
+	for id, rec := range tracked {
 		if selected[id] {
 			continue
 		}
@@ -309,7 +310,9 @@ func (s *Syncer) removeUnselected(ctx context.Context, selected map[string]bool)
 		}
 	}
 	for _, id := range stale {
-		s.st.Forget(id)
+		if err := s.st.Forget(context.WithoutCancel(ctx), id); err != nil {
+			s.log.ErrorContext(ctx, "forgetting removed asset failed", "asset", id, "err", err)
+		}
 	}
 	if s.rec != nil {
 		s.rec.Removed(ctx, "success", len(stale))
@@ -384,11 +387,13 @@ func fail(span trace.Span, err error) error {
 type tokenStore struct{ st *state.State }
 
 func (t *tokenStore) Tokens() (string, string, time.Time) {
-	tk := t.st.GetTokens()
+	tk, err := t.st.GetTokens(context.Background())
+	if err != nil {
+		return "", "", time.Time{}
+	}
 	return tk.AccessToken, tk.RefreshToken, tk.Expiry
 }
 
 func (t *tokenStore) SaveTokens(access, refresh string, expiry time.Time) error {
-	t.st.SetTokens(state.Tokens{AccessToken: access, RefreshToken: refresh, Expiry: expiry})
-	return t.st.Save()
+	return t.st.SetTokens(context.Background(), state.Tokens{AccessToken: access, RefreshToken: refresh, Expiry: expiry})
 }

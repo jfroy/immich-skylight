@@ -33,7 +33,7 @@ FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 COPY --from=build /out/immich-skylight /immich-skylight
 
 USER nonroot:nonroot
-ENV STATE_FILE=/data/state.json \
+ENV STATE_FILE=/data/state.db \
     HTTP_ADDR=:8080
 EXPOSE 8080
 ENTRYPOINT ["/immich-skylight"]

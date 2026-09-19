@@ -29,7 +29,7 @@ spec:
               IMMICH_IMAGE_SOURCE: preview
               REMOVE_UNSELECTED: "false"
               SYNC_INTERVAL: 15m
-              STATE_FILE: /data/state.json
+              STATE_FILE: /data/state.db
               HTTP_ADDR: :8080
               LOG_LEVEL: info
               TZ: America/Los_Angeles

@@ -12,7 +12,7 @@ Un-favorite it → optionally removed from the frame.
 │ Immich │ ─────────────────▶ │ immich-skylight │ ────────────────────▶ │ Skylight │
 │        │ ◀───────────────── │   (daemon)      │                       │  frame   │
 └────────┘  thumbnail/original└───────┬─────────┘                       └──────────┘
-                                      │ state.json: tokens + {assetID → messageIDs}
+                                      │ state.db (SQLite): tokens + asset → frame → message IDs
 ```
 
 1. **Select** – queries Immich for favorites and/or assets carrying configured tags
@@ -25,8 +25,10 @@ Un-favorite it → optionally removed from the frame.
    then a direct `PUT` of the bytes. This daemon owns the credential lifecycle: refresh
    tokens are persisted and rotated, sessions refresh proactively before expiry, a 401
    triggers one re-auth + retry, and if refresh fails it re-logs-in with your password.
-4. **Remember** – every uploaded asset is written to `state.json` with its Skylight
-   message IDs so nothing is ever sent twice, and so it can be deleted later.
+4. **Remember** – every uploaded asset is committed to a SQLite database (`state.db`,
+   pure-Go driver, WAL mode) with its per-frame Skylight message IDs, so nothing is ever
+   sent twice and photos can be deleted later. Each upload is its own transaction; a
+   crash mid-pass cannot lose or duplicate a record.
 5. **Reverse sync** (optional, `REMOVE_UNSELECTED=true`) – photos no longer
    favorited/tagged in Immich are deleted from the frame.
 
@@ -58,7 +60,7 @@ Two deployment flavours are included:
 
 Both run with `runAsNonRoot` (uid 65532), `readOnlyRootFilesystem`, all capabilities
 dropped, `RuntimeDefault` seccomp, no service-account token, and a 1 Gi PVC at `/data`
-for `state.json` — the only path the process ever writes. Secrets are plain env vars via
+for `state.db` — the only path the process ever writes. Secrets are plain env vars via
 `envFrom.secretRef`.
 
 Find your frame ID once with a one-off pod (or locally) using `frames`:
@@ -66,8 +68,8 @@ Find your frame ID once with a one-off pod (or locally) using `frames`:
 ```bash
 kubectl -n default run -it --rm skylight-frames --restart=Never \
   --image=ghcr.io/jfroy/immich-skylight:latest \
-  --env STATE_FILE=/tmp/state.json \
-  --overrides='{"spec":{"containers":[{"name":"skylight-frames","image":"ghcr.io/jfroy/immich-skylight:latest","args":["frames"],"envFrom":[{"secretRef":{"name":"immich-skylight"}}],"env":[{"name":"STATE_FILE","value":"/tmp/state.json"}]}]}}'
+  --env STATE_FILE=/tmp/state.db \
+  --overrides='{"spec":{"containers":[{"name":"skylight-frames","image":"ghcr.io/jfroy/immich-skylight:latest","args":["frames"],"envFrom":[{"secretRef":{"name":"immich-skylight"}}],"env":[{"name":"STATE_FILE","value":"/tmp/state.db"}]}]}}'
 ```
 
 ## Quick start (local binary / Docker)
@@ -101,7 +103,7 @@ All configuration is via environment variables.
 | `SKYLIGHT_CAPTION` | `true` | Use the Immich description as the photo caption. |
 | `REMOVE_UNSELECTED` | `false` | Delete photos from the frame when they stop being selected in Immich. |
 | `SYNC_INTERVAL` | `15m` | Poll interval for `run`. |
-| `STATE_FILE` | `/data/state.json` | Where tokens and sent-asset records live. Back this up if you care about `REMOVE_UNSELECTED`. |
+| `STATE_FILE` | `/data/state.db` | SQLite database holding tokens and sent-asset records. WAL sidecar files (`-wal`, `-shm`) are created alongside. Back it up if you care about `REMOVE_UNSELECTED`. |
 | `DRY_RUN` | `false` | Log what would be uploaded/removed without touching Skylight. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
 | `HTTP_ADDR` | `:8080` | Listener for `/metrics`, `/healthz`, `/readyz`. |
@@ -151,7 +153,10 @@ Either `IMMICH_FAVORITES=true` or at least one `IMMICH_TAGS` entry must be set.
 - Photos are uploaded oldest-first so the frame's feed stays chronological.
 - Assets already on the frame before you started using this tool are unknown to it and
   never touched.
-- `state.json` contains your Skylight refresh token; it's written `0600`. Treat it as a secret.
+- `state.db` contains your Skylight refresh token. Treat it as a secret.
+- Upgrading from the JSON state file: on first start with an empty database, a legacy
+  `state.json` next to it (or `STATE_FILE` with `.json` swapped in) is imported and
+  renamed `*.imported`.
 - If Skylight changes its login flow, `frames`/`run` will fail at "skylight login";
   check for a newer [go-skylight](https://github.com/sebrandon1/go-skylight) and bump it
   (`go get github.com/sebrandon1/go-skylight@main`). Renovate is configured to propose this.

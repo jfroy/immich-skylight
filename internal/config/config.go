@@ -66,7 +66,7 @@ func Load() (*Config, error) {
 		FrameNames:       envList("SKYLIGHT_FRAME_NAMES"),
 		UseCaption:       envBool("SKYLIGHT_CAPTION", true),
 		RemoveUnselected: envBool("REMOVE_UNSELECTED", false),
-		StateFile:        env("STATE_FILE", "/data/state.json"),
+		StateFile:        env("STATE_FILE", "/data/state.db"),
 		DryRun:           envBool("DRY_RUN", false),
 		LogLevel:         env("LOG_LEVEL", "info"),
 		HTTPAddr:         env("HTTP_ADDR", ":8080"),

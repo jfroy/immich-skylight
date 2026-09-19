@@ -1,15 +1,21 @@
-// Package state persists sync progress and Skylight credentials to a JSON file.
+// Package state persists sync progress and Skylight credentials in a SQLite
+// database (pure-Go driver, no cgo). Every mutation is committed immediately,
+// so a crash mid-pass never loses or duplicates an upload record.
 package state
 
 import (
+	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
+	"strings"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 // Sent records an asset that has been uploaded to Skylight.
@@ -22,114 +28,316 @@ type Sent struct {
 
 // Tokens holds the Skylight OAuth credentials.
 type Tokens struct {
-	AccessToken  string    `json:"access_token,omitempty"`
-	RefreshToken string    `json:"refresh_token,omitempty"`
-	Expiry       time.Time `json:"expiry,omitempty"`
+	AccessToken  string
+	RefreshToken string
+	Expiry       time.Time
 }
 
-// State is the on-disk document.
+// State is a handle to the database.
 type State struct {
-	Version     int             `json:"version"`
-	Fingerprint string          `json:"device_fingerprint"`
-	Tokens      Tokens          `json:"skylight_tokens"`
-	Sent        map[string]Sent `json:"sent"` // Immich asset ID -> upload record
+	// Fingerprint is the stable per-installation device UUID.
+	Fingerprint string
 
-	path string
-	mu   sync.RWMutex
+	db *sql.DB
 }
 
-// Load reads the state file, creating a fresh state if it does not exist.
-func Load(path string) (*State, error) {
-	s := &State{Version: 2, Sent: map[string]Sent{}, path: path}
-	b, err := os.ReadFile(path)
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-	case err != nil:
-		return nil, fmt.Errorf("reading state %s: %w", path, err)
-	default:
-		if err := json.Unmarshal(b, s); err != nil {
-			return nil, fmt.Errorf("parsing state %s: %w", path, err)
+const schema = `
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sent (
+  asset_id TEXT PRIMARY KEY,
+  checksum TEXT,
+  sent_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sent_message (
+  asset_id   TEXT    NOT NULL REFERENCES sent(asset_id) ON DELETE CASCADE,
+  frame_id   TEXT    NOT NULL,
+  message_id INTEGER NOT NULL,
+  PRIMARY KEY (asset_id, frame_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS sent_message_frame ON sent_message(frame_id);
+`
+
+// Open opens (creating if needed) the database at path. If the database is
+// empty and a legacy JSON state file exists at the same path with a .json
+// extension (or next to it as state.json), it is imported once.
+func Open(ctx context.Context, path string) (*State, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	dsn := "file:" + path + "?_pragma=busy_timeout(5000)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("opening state db: %w", err)
+	}
+	// One connection: SQLite has a single writer, and the WAL pragma is
+	// per-connection; this keeps behavior predictable.
+	db.SetMaxOpenConns(1)
+	if _, err := db.ExecContext(ctx, schema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("initializing state schema: %w", err)
+	}
+	s := &State{db: db}
+
+	if s.Fingerprint, err = s.meta(ctx, "device_fingerprint"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if s.Fingerprint == "" {
+		if err := s.importLegacy(ctx, path); err != nil {
+			db.Close()
+			return nil, err
 		}
-		if s.Sent == nil {
-			s.Sent = map[string]Sent{}
+		if s.Fingerprint, err = s.meta(ctx, "device_fingerprint"); err != nil {
+			db.Close()
+			return nil, err
 		}
 	}
 	if s.Fingerprint == "" {
 		s.Fingerprint = newUUID()
+		if err := s.setMeta(ctx, "device_fingerprint", s.Fingerprint); err != nil {
+			db.Close()
+			return nil, err
+		}
 	}
 	return s, nil
 }
 
-// Save atomically writes the state to disk.
-func (s *State) Save() error {
-	s.mu.RLock()
-	b, err := json.MarshalIndent(s, "", "  ")
-	s.mu.RUnlock()
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
-		return err
-	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.path)
-}
+// Close closes the database.
+func (s *State) Close() error { return s.db.Close() }
 
 // Has reports whether an asset has been sent.
-func (s *State) Has(assetID string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	_, ok := s.Sent[assetID]
-	return ok
-}
-
-// Snapshot returns a copy of the sent map.
-func (s *State) Snapshot() map[string]Sent {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make(map[string]Sent, len(s.Sent))
-	for k, v := range s.Sent {
-		out[k] = v
-	}
-	return out
+func (s *State) Has(ctx context.Context, assetID string) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sent WHERE asset_id = ?`, assetID).Scan(&n)
+	return n > 0, err
 }
 
 // Count returns the number of tracked assets.
-func (s *State) Count() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.Sent)
+func (s *State) Count(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sent`).Scan(&n)
+	return n, err
 }
 
-// MarkSent records an uploaded asset.
-func (s *State) MarkSent(assetID string, rec Sent) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.Sent[assetID] = rec
+// Get returns one record.
+func (s *State) Get(ctx context.Context, assetID string) (Sent, bool, error) {
+	all, err := s.Snapshot(ctx)
+	if err != nil {
+		return Sent{}, false, err
+	}
+	rec, ok := all[assetID]
+	return rec, ok, nil
 }
 
-// Forget removes an asset record.
-func (s *State) Forget(assetID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.Sent, assetID)
+// Snapshot returns all sent records.
+func (s *State) Snapshot(ctx context.Context) (map[string]Sent, error) {
+	out := map[string]Sent{}
+	rows, err := s.db.QueryContext(ctx, `SELECT asset_id, COALESCE(checksum,''), sent_at FROM sent`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id, sum, at string
+		if err := rows.Scan(&id, &sum, &at); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		t, _ := time.Parse(time.RFC3339Nano, at)
+		out[id] = Sent{Messages: map[string][]int{}, Checksum: sum, SentAt: t}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	rows, err = s.db.QueryContext(ctx, `SELECT asset_id, frame_id, message_id FROM sent_message ORDER BY asset_id, frame_id, message_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, frame string
+		var msg int
+		if err := rows.Scan(&id, &frame, &msg); err != nil {
+			return nil, err
+		}
+		if rec, ok := out[id]; ok {
+			rec.Messages[frame] = append(rec.Messages[frame], msg)
+		}
+	}
+	return out, rows.Err()
+}
+
+// MarkSent records an uploaded asset (replacing any existing record).
+func (s *State) MarkSent(ctx context.Context, assetID string, rec Sent) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		if rec.SentAt.IsZero() {
+			rec.SentAt = time.Now()
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sent WHERE asset_id = ?`, assetID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO sent(asset_id, checksum, sent_at) VALUES (?, ?, ?)`,
+			assetID, rec.Checksum, rec.SentAt.UTC().Format(time.RFC3339Nano)); err != nil {
+			return err
+		}
+		for frame, ids := range rec.Messages {
+			for _, id := range ids {
+				if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO sent_message(asset_id, frame_id, message_id) VALUES (?, ?, ?)`,
+					assetID, frame, id); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+}
+
+// Forget removes an asset record (and its messages).
+func (s *State) Forget(ctx context.Context, assetID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sent WHERE asset_id = ?`, assetID)
+	return err
 }
 
 // SetTokens replaces the stored Skylight tokens.
-func (s *State) SetTokens(t Tokens) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.Tokens = t
+func (s *State) SetTokens(ctx context.Context, t Tokens) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		exp := ""
+		if !t.Expiry.IsZero() {
+			exp = t.Expiry.UTC().Format(time.RFC3339Nano)
+		}
+		for k, v := range map[string]string{
+			"access_token": t.AccessToken, "refresh_token": t.RefreshToken, "token_expiry": exp,
+		} {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, k, v); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // GetTokens returns the stored Skylight tokens.
-func (s *State) GetTokens() Tokens {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.Tokens
+func (s *State) GetTokens(ctx context.Context) (Tokens, error) {
+	var t Tokens
+	var err error
+	if t.AccessToken, err = s.meta(ctx, "access_token"); err != nil {
+		return t, err
+	}
+	if t.RefreshToken, err = s.meta(ctx, "refresh_token"); err != nil {
+		return t, err
+	}
+	exp, err := s.meta(ctx, "token_expiry")
+	if err != nil {
+		return t, err
+	}
+	if exp != "" {
+		t.Expiry, _ = time.Parse(time.RFC3339Nano, exp)
+	}
+	return t, nil
+}
+
+func (s *State) meta(ctx context.Context, key string) (string, error) {
+	var v string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = ?`, key).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return v, err
+}
+
+func (s *State) setMeta(ctx context.Context, key, value string) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
+	return err
+}
+
+func (s *State) tx(ctx context.Context, fn func(*sql.Tx) error) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if err := fn(tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// legacyJSON is the pre-SQLite on-disk document.
+type legacyJSON struct {
+	Fingerprint string `json:"device_fingerprint"`
+	Tokens      struct {
+		AccessToken  string    `json:"access_token"`
+		RefreshToken string    `json:"refresh_token"`
+		Expiry       time.Time `json:"expiry"`
+	} `json:"skylight_tokens"`
+	Sent map[string]struct {
+		Messages   map[string][]int `json:"messages"`
+		MessageIDs []int            `json:"message_ids"` // v1 shape
+		FrameIDs   []string         `json:"frame_ids"`   // v1 shape
+		Checksum   string           `json:"checksum"`
+		SentAt     time.Time        `json:"sent_at"`
+	} `json:"sent"`
+}
+
+// importLegacy migrates a JSON state file into the (empty) database and
+// renames it to *.imported.
+func (s *State) importLegacy(ctx context.Context, dbPath string) error {
+	candidates := []string{
+		strings.TrimSuffix(dbPath, filepath.Ext(dbPath)) + ".json",
+		filepath.Join(filepath.Dir(dbPath), "state.json"),
+	}
+	for _, p := range candidates {
+		b, err := os.ReadFile(p)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("reading legacy state %s: %w", p, err)
+		}
+		var doc legacyJSON
+		if err := json.Unmarshal(b, &doc); err != nil {
+			return fmt.Errorf("parsing legacy state %s: %w", p, err)
+		}
+		if doc.Fingerprint != "" {
+			if err := s.setMeta(ctx, "device_fingerprint", doc.Fingerprint); err != nil {
+				return err
+			}
+		}
+		if err := s.SetTokens(ctx, Tokens{doc.Tokens.AccessToken, doc.Tokens.RefreshToken, doc.Tokens.Expiry}); err != nil {
+			return err
+		}
+		for id, rec := range doc.Sent {
+			msgs := rec.Messages
+			if msgs == nil {
+				msgs = map[string][]int{}
+				for i, mid := range rec.MessageIDs { // v1: one message per frame, in order
+					f := "unknown"
+					if i < len(rec.FrameIDs) {
+						f = rec.FrameIDs[i]
+					} else if len(rec.FrameIDs) > 0 {
+						f = rec.FrameIDs[0]
+					}
+					msgs[f] = append(msgs[f], mid)
+				}
+			}
+			if err := s.MarkSent(ctx, id, Sent{Messages: msgs, Checksum: rec.Checksum, SentAt: rec.SentAt}); err != nil {
+				return err
+			}
+		}
+		_ = os.Rename(p, p+".imported")
+		return nil
+	}
+	return nil
 }
 
 // newUUID returns a random RFC 4122 v4 UUID string.

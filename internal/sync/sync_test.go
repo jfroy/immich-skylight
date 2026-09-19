@@ -255,15 +255,16 @@ func setup(t *testing.T, cfgMut func(*config.Config)) (*fakeImmich, *fakeSkyligh
 		ImmichURL: imSrv.URL, ImmichAPIKey: "key", Favorites: true,
 		ImageSource: config.SourcePreview, SkylightEmail: "e", SkylightPassword: "pw",
 		FrameNames: []string{"kitchen"}, UseCaption: true, Interval: time.Hour,
-		StateFile: filepath.Join(t.TempDir(), "state.json"),
+		StateFile: filepath.Join(t.TempDir(), "state.db"),
 	}
 	if cfgMut != nil {
 		cfgMut(cfg)
 	}
-	st, err := state.Load(cfg.StateFile)
+	st, err := state.Open(context.Background(), cfg.StateFile)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { st.Close() })
 	return fi, fs, cfg, st
 }
 
@@ -299,8 +300,8 @@ func TestEndToEnd(t *testing.T) {
 	if len(fs.captions) != 2 || !strings.HasPrefix(fs.captions[0], "caption ") {
 		t.Errorf("captions = %v", fs.captions)
 	}
-	if len(st.Sent) != 2 {
-		t.Fatalf("state.Sent = %v", st.Sent)
+	if n, _ := st.Count(ctx); n != 2 {
+		t.Fatalf("tracked = %d", n)
 	}
 	if fs.logins != 1 {
 		t.Errorf("logins = %d, want 1", fs.logins)
@@ -323,23 +324,27 @@ func TestEndToEnd(t *testing.T) {
 	if err := s.Once(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if len(fs.deleted) != 1 || len(st.Sent) != 1 {
-		t.Errorf("deleted=%v sent=%v", fs.deleted, st.Sent)
+	if n, _ := st.Count(ctx); len(fs.deleted) != 1 || n != 1 {
+		t.Errorf("deleted=%v tracked=%d", fs.deleted, n)
 	}
-	if _, ok := st.Sent["b"]; !ok {
+	if _, ok, _ := st.Get(ctx, "b"); !ok {
 		t.Errorf("b should remain in state")
 	}
 
 	// State persisted and reloadable with tokens.
-	st2, err := state.Load(cfg.StateFile)
+	st.Close()
+	st2, err := state.Open(ctx, cfg.StateFile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st2.Tokens.RefreshToken != "R1" || len(st2.Sent) != 1 || st2.Fingerprint != st.Fingerprint {
-		t.Errorf("persisted state mismatch: %+v", st2)
+	defer st2.Close()
+	tk, _ := st2.GetTokens(ctx)
+	n2, _ := st2.Count(ctx)
+	if tk.RefreshToken != "R1" || n2 != 1 || st2.Fingerprint != st.Fingerprint {
+		t.Errorf("persisted state mismatch: tokens=%+v n=%d fp=%s/%s", tk, n2, st2.Fingerprint, st.Fingerprint)
 	}
-	if got := st2.Sent["b"].Messages["111"]; len(got) != 1 {
-		t.Errorf("persisted state mismatch: %+v", st2)
+	if rec, _, _ := st2.Get(ctx, "b"); len(rec.Messages["111"]) != 1 {
+		t.Errorf("persisted messages mismatch: %+v", rec)
 	}
 }
 
@@ -385,7 +390,9 @@ func TestTokenRefreshAndReauth(t *testing.T) {
 
 	// Corrupt the refresh token and expire the session: next call must fall
 	// back to password login.
-	st.SetTokens(state.Tokens{AccessToken: "", RefreshToken: "BAD"})
+	if err := st.SetTokens(ctx, state.Tokens{AccessToken: "", RefreshToken: "BAD"}); err != nil {
+		t.Fatal(err)
+	}
 	s.sky.ExpireForTest()
 	fi.favorites = append(fi.favorites, asset("b", "image/jpeg", "IMAGE"))
 	if err := s.Once(ctx); err != nil {

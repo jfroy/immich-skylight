@@ -74,7 +74,7 @@ func run(ctx context.Context, cmd string) error {
 		cfg = &config.Config{
 			SkylightEmail:    os.Getenv("SKYLIGHT_EMAIL"),
 			SkylightPassword: os.Getenv("SKYLIGHT_PASSWORD"),
-			StateFile:        envOr("STATE_FILE", "/data/state.json"),
+			StateFile:        envOr("STATE_FILE", "/data/state.db"),
 			LogLevel:         envOr("LOG_LEVEL", "info"),
 			ServiceName:      envOr("OTEL_SERVICE_NAME", "immich-skylight"),
 		}
@@ -103,10 +103,11 @@ func run(ctx context.Context, cmd string) error {
 		return fmt.Errorf("registering metrics: %w", err)
 	}
 
-	st, err := state.Load(cfg.StateFile)
+	st, err := state.Open(ctx, cfg.StateFile)
 	if err != nil {
 		return err
 	}
+	defer st.Close()
 
 	if cmd == "frames" {
 		return listFrames(ctx, cfg, st, log, rec)
@@ -210,18 +211,18 @@ func listFrames(ctx context.Context, cfg *config.Config, st *state.State, log *s
 	return nil
 }
 
-// memStore keeps tokens in memory only, so `frames` has no side effects on disk.
+// memStore reads persisted tokens but never writes, so `frames` has no side effects.
 type memStore struct{ st *state.State }
 
 func (m memStore) Tokens() (string, string, time.Time) {
-	t := m.st.GetTokens()
+	t, err := m.st.GetTokens(context.Background())
+	if err != nil {
+		return "", "", time.Time{}
+	}
 	return t.AccessToken, t.RefreshToken, t.Expiry
 }
 
-func (m memStore) SaveTokens(a, r string, e time.Time) error {
-	m.st.SetTokens(state.Tokens{AccessToken: a, RefreshToken: r, Expiry: e})
-	return nil
-}
+func (m memStore) SaveTokens(string, string, time.Time) error { return nil }
 
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
