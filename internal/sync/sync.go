@@ -308,7 +308,7 @@ func (s *Syncer) Once(ctx context.Context) (err error) {
 		}
 		span.End()
 	}()
-	log := s.log.With("trace_id", span.SpanContext().TraceID().String())
+	log := s.log
 
 	desired, assets, err := s.desired(ctx)
 	if err != nil {
@@ -443,7 +443,7 @@ func (s *Syncer) upload(ctx context.Context, a immich.Asset, frames []string, ex
 		s.record(ctx, "fetch_failed", rendition, 0)
 		return err
 	}
-	span.SetAttributes(attribute.String("rendition", rendition), attribute.String("ext", ext), attribute.Int("bytes", len(data)))
+	span.SetAttributes(attribute.String("rendition", rendition), attribute.String("format", ext), attribute.Int("bytes", len(data)))
 
 	caption := ""
 	if s.cfg.UseCaption {
@@ -451,7 +451,7 @@ func (s *Syncer) upload(ctx context.Context, a immich.Asset, frames []string, ex
 	}
 
 	if s.cfg.DryRun {
-		s.log.InfoContext(ctx, "dry-run: would upload", "asset", a.ID, "file", a.OriginalFileName, "ext", ext, "bytes", len(data), "caption", caption)
+		s.log.InfoContext(ctx, "dry-run: would upload", "asset", a.ID, "file", a.OriginalFileName, "rendition", rendition, "format", ext, "bytes", len(data), "caption", caption)
 		s.record(ctx, "dry_run", rendition, len(data))
 		return nil
 	}
@@ -475,7 +475,7 @@ func (s *Syncer) upload(ctx context.Context, a immich.Asset, frames []string, ex
 		return err
 	}
 	s.record(ctx, "success", rendition, len(data))
-	s.log.InfoContext(ctx, "uploaded", "asset", a.ID, "file", a.OriginalFileName, "ext", ext, "bytes", len(data), "frames", len(results))
+	s.log.InfoContext(ctx, "uploaded", "asset", a.ID, "file", a.OriginalFileName, "rendition", rendition, "format", ext, "bytes", len(data), "frames", len(results))
 	return nil
 }
 
