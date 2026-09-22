@@ -22,8 +22,8 @@ Un-favorite it → optionally removed from the frame.
                                 └─────────────────┘
 ```
 
-1. **Select** – queries Immich for favorites and/or assets carrying configured tags
-   (`POST /api/search/metadata`). These go to every target frame. In addition, a
+1. **Select** – queries Immich (via [immich-go](https://github.com/simulot/immich-go)'s
+   client) for favorites and/or assets carrying configured tags (`POST /api/search/metadata`). These go to every target frame. In addition, a
    **per-frame tag** (default `Skylight/<frame name>`) is created in Immich for each
    frame; tagging a photo with it sends it to that frame only.
 2. **Fetch** – downloads Immich's `preview` rendition by default: a JPEG that already
@@ -146,7 +146,7 @@ All configuration is via environment variables.
 | Variable | Default | Description |
 |---|---|---|
 | `IMMICH_URL` | — | Immich server URL. **Required.** |
-| `IMMICH_API_KEY` | — | Immich API key (Account Settings → API Keys). **Required.** Needs `asset.read`, `asset.download`, `tag.read`, `user.read`. |
+| `IMMICH_API_KEY` | — | Immich API key (Account Settings → API Keys). **Required.** See [API key permissions](#immich-api-key-permissions). |
 | `IMMICH_FAVORITES` | `true` | Sync favorited photos. |
 | `IMMICH_TAGS` | — | Comma-separated tag names or full paths (`Skylight`, `Family/Skylight`). Case-insensitive. Any listed tag qualifies. |
 | `IMMICH_IMAGE_SOURCE` | `preview` | `preview` (~1440px JPEG), `fullsize`, or `original`. Falls back down the chain if unavailable/unsupported. |
@@ -165,6 +165,21 @@ All configuration is via environment variables.
 | `WEBHOOK_SECRET` | — | Enables `POST /webhook`; requests must send this value in `X-Webhook-Secret`. |
 | `OTEL_SERVICE_NAME` | `immich-skylight` | Service name in telemetry. |
 | `OTEL_EXPORTER_OTLP_*` | — | Standard OTel SDK variables. Setting an endpoint enables OTLP export of traces, metrics and logs. |
+
+### Immich API key permissions
+
+Create the key with only these permissions (Immich → Account Settings → API Keys):
+
+| Permission | Used for |
+|---|---|
+| `user.read` | `GET /users/me` — connectivity/auth check at startup |
+| `asset.read` | `POST /search/metadata` — finding favorites and tagged assets |
+| `asset.view` | `GET /assets/{id}/thumbnail` — the default `preview`/`fullsize` renditions |
+| `asset.download` | `GET /assets/{id}/original` — `IMMICH_IMAGE_SOURCE=original`, videos, and `fullsize` when Immich redirects to the original |
+| `tag.read` | `GET /tags` — resolving `IMMICH_TAGS` |
+| `tag.create` | `PUT /tags` — upserting the per-frame tags (`IMMICH_FRAME_TAG_TEMPLATE`). Not needed if that is disabled. |
+
+The key never modifies assets; it only reads them and creates tags.
 
 At least one of `IMMICH_FAVORITES=true`, `IMMICH_TAGS`, or `IMMICH_FRAME_TAG_TEMPLATE` must
 be set (all three are on by default via favorites + the frame tag template).
