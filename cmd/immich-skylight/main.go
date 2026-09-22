@@ -145,7 +145,7 @@ func run(ctx context.Context, cmd string) error {
 	}()
 
 	setup := func() (*isync.Syncer, error) {
-		return isync.New(ctx, isync.Options{Config: cfg, State: st, Logger: log, Metrics: rec})
+		return isync.New(ctx, isync.Options{Config: cfg, State: st, Logger: log, Metrics: rec, Version: version})
 	}
 	var sy *isync.Syncer
 	if cmd == "run" {

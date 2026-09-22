@@ -54,9 +54,6 @@ func (f *fakeImmich) handler(t *testing.T) http.Handler {
 		}
 		fmt.Fprint(w, `{"email":"me@x"}`)
 	})
-	mux.HandleFunc("/api/server/media-types", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"image":[".jpg",".heic"],"video":[".mp4"],"sidecar":[".xmp"]}`)
-	})
 	mux.HandleFunc("/api/tags/", func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimPrefix(r.URL.Path, "/api/tags/")
 		f.mu.Lock()
@@ -135,7 +132,7 @@ func (f *fakeImmich) handler(t *testing.T) http.Handler {
 			}
 		}
 		f.mu.Unlock()
-		if body["page"].(float64) > 1 {
+		if pg, _ := body["page"].(float64); pg > 1 || body["cursor"] != nil {
 			items = nil
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"assets": map[string]any{"items": items, "nextPage": nil}})
