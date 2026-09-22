@@ -7,9 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"mime"
 	"net/http"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"text/template"
@@ -55,6 +53,8 @@ type Options struct {
 	Metrics *metrics.Recorder
 	// SkylightBaseURL overrides the Skylight API base (tests).
 	SkylightBaseURL string
+	// Version is reported in the Immich User-Agent.
+	Version string
 }
 
 // New wires up clients and resolves tags and frames. It fails fast on bad
@@ -67,10 +67,12 @@ func New(ctx context.Context, o Options) (*Syncer, error) {
 	s := &Syncer{cfg: cfg, st: o.State, log: o.Logger, rec: o.Metrics, trigger: make(chan struct{}, 1)}
 	var err error
 
-	imClassify := func(*http.Request) string { return "immich" }
-	s.im, err = immich.New(cfg.ImmichURL, cfg.ImmichAPIKey, func(rt http.RoundTripper) http.RoundTripper {
-		return httpx.NewTransport(rt, o.Metrics, imClassify)
-	}, 5*time.Minute)
+	s.im, err = immich.New(immich.Options{
+		BaseURL:    cfg.ImmichURL,
+		APIKey:     cfg.ImmichAPIKey,
+		HTTPClient: httpx.NewClient(o.Metrics, func(*http.Request) string { return "immich" }, 5*time.Minute),
+		UserAgent:  "immich-skylight/" + o.Version,
+	})
 	if err != nil {
 		return nil, fail(span, err)
 	}
@@ -90,8 +92,8 @@ func New(ctx context.Context, o Options) (*Syncer, error) {
 		return nil, err
 	}
 
-	if err := s.im.Ping(ctx); err != nil {
-		return nil, fail(span, err)
+	if _, err := s.im.Me(ctx); err != nil {
+		return nil, fail(span, fmt.Errorf("immich auth check failed: %w", err))
 	}
 	if s.tags, err = s.im.ResolveTags(ctx, cfg.Tags); err != nil {
 		return nil, fail(span, err)
@@ -193,7 +195,7 @@ func (s *Syncer) setupFrameTags(ctx context.Context, frames []skylight.Frame) er
 			s.frameTags[cur.ID] = f.ID
 		default:
 			if have && alive {
-				n, _ := s.im.TagAssetCount(ctx, cur.ID)
+				n, _ := s.tagAssetCount(ctx, cur.ID)
 				s.log.WarnContext(ctx, "frame tag path changed beyond a rename; leaving old tag in place",
 					"frame", f.Name, "old", cur.Value, "new", want, "assets_on_old_tag", n)
 			}
@@ -232,7 +234,7 @@ func (s *Syncer) setupFrameTags(ctx context.Context, frames []skylight.Frame) er
 			continue
 		}
 		if !s.cfg.PruneFrameTags {
-			n, _ := s.im.TagAssetCount(ctx, cur.ID)
+			n, _ := s.tagAssetCount(ctx, cur.ID)
 			s.log.WarnContext(ctx, "frame is no longer a target; its tag remains (set PRUNE_FRAME_TAGS=true to delete)",
 				"frame_id", frameID, "tag", cur.Value, "assets", n)
 			continue
@@ -391,27 +393,43 @@ func (s *Syncer) desired(ctx context.Context) (map[string]map[string]bool, []imm
 		}
 	}
 
-	if s.cfg.Favorites || len(s.tags) > 0 {
-		assets, err := s.im.Search(ctx, immich.SearchOptions{
-			Favorites: s.cfg.Favorites, TagIDs: s.tags, IncludeVideo: s.cfg.IncludeVideo,
-		})
-		if err != nil {
-			return nil, nil, err
-		}
-		for _, a := range assets {
-			add(a, s.frames)
-		}
+	// Each query is a separate search so the union is computed here.
+	type q struct {
+		query  immich.Query
+		frames []string
+		what   string
+	}
+	var queries []q
+	if s.cfg.Favorites {
+		queries = append(queries, q{immich.Query{IsFavorite: true, IncludeVideo: s.cfg.IncludeVideo}, s.frames, "favorites"})
+	}
+	if len(s.tags) > 0 {
+		queries = append(queries, q{immich.Query{TagIDs: s.tags, IncludeVideo: s.cfg.IncludeVideo}, s.frames, "tags"})
 	}
 	for tagID, frameID := range s.frameTags {
-		assets, err := s.im.SearchByTag(ctx, tagID, s.cfg.IncludeVideo)
-		if err != nil {
-			return nil, nil, fmt.Errorf("searching frame tag: %w", err)
-		}
-		for _, a := range assets {
-			add(a, []string{frameID})
+		queries = append(queries, q{immich.Query{TagIDs: []string{tagID}, IncludeVideo: s.cfg.IncludeVideo}, []string{frameID}, "frame tag"})
+	}
+	for _, qq := range queries {
+		for a, err := range s.im.Assets(ctx, qq.query) {
+			if err != nil {
+				return nil, nil, fmt.Errorf("searching %s: %w", qq.what, err)
+			}
+			add(a, qq.frames)
 		}
 	}
 	return desired, order, nil
+}
+
+// tagAssetCount counts assets carrying a tag (for diagnostics only).
+func (s *Syncer) tagAssetCount(ctx context.Context, tagID string) (int, error) {
+	n := 0
+	for _, err := range s.im.Assets(ctx, immich.Query{TagIDs: []string{tagID}, IncludeVideo: true}) {
+		if err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
 }
 
 func (s *Syncer) upload(ctx context.Context, a immich.Asset, frames []string, existing state.Sent) (err error) {
@@ -429,7 +447,7 @@ func (s *Syncer) upload(ctx context.Context, a immich.Asset, frames []string, ex
 
 	caption := ""
 	if s.cfg.UseCaption {
-		caption = strings.TrimSpace(a.Description)
+		caption = a.Description()
 	}
 
 	if s.cfg.DryRun {
@@ -480,20 +498,20 @@ func (s *Syncer) fetch(ctx context.Context, a immich.Asset) (data []byte, ext, r
 	var lastErr error
 	for _, r := range chain {
 		rendition = string(r)
-		if r == immich.RenditionOriginal && skylight.SupportedExt(mimeByName(a.OriginalFileName)) == "" {
-			lastErr = fmt.Errorf("original %s is not a type skylight accepts", filepath.Ext(a.OriginalFileName))
+		if r == immich.RenditionOriginal && skylight.SupportedExt(a.OriginalMimeType) == "" {
+			lastErr = fmt.Errorf("original type %s not supported by skylight", a.OriginalMimeType)
 			continue
 		}
-		var mime string
-		data, mime, err = s.im.Download(ctx, a.ID, r)
+		blob, err := s.im.Download(ctx, a.ID, r)
 		if err != nil {
 			lastErr = fmt.Errorf("download %s: %w", r, err)
 			continue
 		}
-		if ext = skylight.SupportedExt(mime); ext == "" {
-			lastErr = fmt.Errorf("rendition %s has unsupported type %q", r, mime)
+		if ext = skylight.SupportedExt(blob.ContentType); ext == "" {
+			lastErr = fmt.Errorf("rendition %s has unsupported type %q", r, blob.ContentType)
 			continue
 		}
+		data = blob.Data
 		return data, ext, rendition, nil
 	}
 	return nil, "", rendition, lastErr
@@ -559,20 +577,6 @@ func (s *Syncer) removeUnselected(ctx context.Context, desired map[string]map[st
 		s.rec.Removed(ctx, "success", removed)
 	}
 	return removed
-}
-
-// mimeByName guesses a MIME type from a filename extension (used only to skip
-// downloading originals Skylight cannot display; the server's Content-Type
-// decides what is actually uploaded).
-func mimeByName(name string) string {
-	ext := strings.ToLower(filepath.Ext(name))
-	switch ext {
-	case ".jpg", ".jpeg":
-		return "image/jpeg"
-	case ".mov":
-		return "video/quicktime"
-	}
-	return mime.TypeByExtension(ext)
 }
 
 func (s *Syncer) record(ctx context.Context, result, rendition string, n int) {

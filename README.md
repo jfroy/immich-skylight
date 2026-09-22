@@ -22,8 +22,8 @@ Un-favorite it → optionally removed from the frame.
                                 └─────────────────┘
 ```
 
-1. **Select** – queries Immich (via [immich-go](https://github.com/simulot/immich-go)'s
-   client) for favorites and/or assets carrying configured tags (`POST /api/search/metadata`). These go to every target frame. In addition, a
+1. **Select** – queries Immich for favorites and/or assets carrying configured tags
+   (`POST /api/search/metadata`, cursor-paginated). These go to every target frame. In addition, a
    **per-frame tag** (default `Skylight/<frame name>`) is created in Immich for each
    frame; tagging a photo with it sends it to that frame only.
 2. **Fetch** – downloads Immich's `preview` rendition by default: a JPEG that already
