@@ -24,13 +24,15 @@ import (
 
 // fakeImmich serves the handful of endpoints the syncer uses.
 type fakeImmich struct {
-	mu        sync.Mutex
-	favorites []map[string]any
-	tagged    []map[string]any            // assets for tag-1 (IMMICH_TAGS)
-	byTag     map[string][]map[string]any // assets for frame tags, by tag id
-	tags      map[string]string           // tag id -> path
-	upserts   [][]string
-	downloads int
+	mu          sync.Mutex
+	favorites   []map[string]any
+	tagged      []map[string]any            // assets for tag-1 (IMMICH_TAGS)
+	byTag       map[string][]map[string]any // assets for frame tags, by tag id
+	tags        map[string]string           // tag id -> path
+	upserts     [][]string
+	renames     []string
+	deletedTags []string
+	downloads   int
 }
 
 var extByMime = map[string]string{"image/jpeg": ".jpg", "image/heic": ".heic", "image/x-canon-cr2": ".cr2", "video/mp4": ".mp4"}
@@ -54,6 +56,36 @@ func (f *fakeImmich) handler(t *testing.T) http.Handler {
 	})
 	mux.HandleFunc("/api/server/media-types", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"image":[".jpg",".heic"],"video":[".mp4"],"sidecar":[".xmp"]}`)
+	})
+	mux.HandleFunc("/api/tags/", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/api/tags/")
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if _, ok := f.tags[id]; !ok {
+			http.Error(w, "no such tag", 404)
+			return
+		}
+		switch r.Method {
+		case http.MethodPut:
+			var body struct {
+				Name string `json:"name"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			old := f.tags[id]
+			parent := ""
+			if i := strings.LastIndex(old, "/"); i >= 0 {
+				parent = old[:i+1]
+			}
+			f.tags[id] = parent + body.Name
+			f.renames = append(f.renames, id+"->"+f.tags[id])
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "name": body.Name, "value": f.tags[id]})
+		case http.MethodDelete:
+			delete(f.tags, id)
+			f.deletedTags = append(f.deletedTags, id)
+			w.WriteHeader(204)
+		default:
+			http.Error(w, "method", 405)
+		}
 	})
 	mux.HandleFunc("/api/tags", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -147,6 +179,7 @@ type fakeSkylight struct {
 	nextID      int
 	expireIn    int
 	revoked     string // bearer token that should be rejected
+	kitchenName string // overrides frame 111 name
 }
 
 func (f *fakeSkylight) handler(t *testing.T, self func() string) http.Handler {
@@ -213,7 +246,13 @@ func (f *fakeSkylight) handler(t *testing.T, self func() string) http.Handler {
 		if !auth(w, r) {
 			return
 		}
-		fmt.Fprint(w, `{"data":[{"id":"111","attributes":{"name":"Kitchen"}},{"id":"222","attributes":{"name":"Office"}}]}`)
+		f.mu.Lock()
+		k := f.kitchenName
+		f.mu.Unlock()
+		if k == "" {
+			k = "Kitchen"
+		}
+		fmt.Fprintf(w, `{"data":[{"id":"111","attributes":{"name":%q}},{"id":"222","attributes":{"name":"Office"}}]}`, k)
 	})
 	mux.HandleFunc("/api/upload_url", func(w http.ResponseWriter, r *http.Request) {
 		if !auth(w, r) {
@@ -570,5 +609,83 @@ func TestTriggerCoalesces(t *testing.T) {
 	case <-s.trigger:
 	default:
 		t.Fatal("trigger not queued")
+	}
+}
+
+func TestFrameTagLifecycle(t *testing.T) {
+	fi, fs, cfg, st := setup(t, func(c *config.Config) {
+		c.Favorites = false
+		c.FrameNames = []string{"Kitchen", "Office"}
+		c.FrameTagTemplate = "Skylight/{{ .Name }}"
+	})
+	ctx := context.Background()
+	if _, err := newSyncer(t, cfg, st); err != nil {
+		t.Fatal(err)
+	}
+	ft, _ := st.FrameTags(ctx)
+	if len(ft) != 2 || ft["111"].TagValue != "Skylight/Kitchen" {
+		t.Fatalf("recorded frame tags = %+v", ft)
+	}
+	kitchenTag := ft["111"].TagID
+
+	// Restart with no changes: no new upserts, no renames.
+	if _, err := newSyncer(t, cfg, st); err != nil {
+		t.Fatal(err)
+	}
+	if len(fi.upserts) != 1 || len(fi.renames) != 0 {
+		t.Errorf("idempotent restart: upserts=%v renames=%v", fi.upserts, fi.renames)
+	}
+
+	// Frame renamed in Skylight -> tag renamed in place, same ID.
+	fs.mu.Lock()
+	fs.kitchenName = "Living Room"
+	fs.mu.Unlock()
+	cfg.FrameNames = []string{"Living Room", "Office"}
+	s, err := newSyncer(t, cfg, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fi.renames) != 1 || fi.tags[kitchenTag] != "Skylight/Living Room" {
+		t.Errorf("rename: renames=%v tags=%v", fi.renames, fi.tags)
+	}
+	if s.frameTags[kitchenTag] != "111" {
+		t.Errorf("renamed tag not mapped to frame: %v", s.frameTags)
+	}
+	if len(fi.upserts) != 1 {
+		t.Errorf("rename should not upsert: %v", fi.upserts)
+	}
+
+	// Template parent change -> new tag, old left in place with a warning.
+	cfg.FrameTagTemplate = "Frames/{{ .Name }}"
+	if _, err := newSyncer(t, cfg, st); err != nil {
+		t.Fatal(err)
+	}
+	if _, stillThere := fi.tags[kitchenTag]; !stillThere || len(fi.upserts) != 2 {
+		t.Errorf("template change: old tag present=%v upserts=%v", stillThere, fi.upserts)
+	}
+	ft, _ = st.FrameTags(ctx)
+	if ft["111"].TagValue != "Frames/Living Room" {
+		t.Errorf("record not updated: %+v", ft["111"])
+	}
+	officeTag := ft["222"].TagID
+
+	// Office dropped from targets: without prune the tag stays; with prune it goes.
+	cfg.FrameNames = []string{"Living Room"}
+	if _, err := newSyncer(t, cfg, st); err != nil {
+		t.Fatal(err)
+	}
+	if len(fi.deletedTags) != 0 {
+		t.Errorf("deleted without prune: %v", fi.deletedTags)
+	}
+	cfg.PruneFrameTags = true
+	if _, err := newSyncer(t, cfg, st); err != nil {
+		t.Fatal(err)
+	}
+	if len(fi.deletedTags) != 1 || fi.deletedTags[0] != officeTag {
+		t.Errorf("prune: deleted=%v want %s", fi.deletedTags, officeTag)
+	}
+	ft, _ = st.FrameTags(ctx)
+	if _, ok := ft["222"]; ok || len(ft) != 1 {
+		t.Errorf("pruned record remains: %+v", ft)
 	}
 }

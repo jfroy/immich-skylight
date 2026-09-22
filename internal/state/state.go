@@ -287,3 +287,42 @@ func newUUID() string {
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
+
+// FrameTag records the Immich tag created for a Skylight frame.
+type FrameTag struct {
+	FrameID  string
+	TagID    string
+	TagValue string
+}
+
+// FrameTags returns all recorded frame tags keyed by frame ID.
+func (s *State) FrameTags(ctx context.Context) (map[string]FrameTag, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT frame_id, tag_id, tag_value FROM frame_tag`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]FrameTag{}
+	for rows.Next() {
+		var ft FrameTag
+		if err := rows.Scan(&ft.FrameID, &ft.TagID, &ft.TagValue); err != nil {
+			return nil, err
+		}
+		out[ft.FrameID] = ft
+	}
+	return out, rows.Err()
+}
+
+// SetFrameTag records (or replaces) the tag for a frame.
+func (s *State) SetFrameTag(ctx context.Context, ft FrameTag) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO frame_tag(frame_id, tag_id, tag_value, updated_at) VALUES (?, ?, ?, ?)
+		ON CONFLICT(frame_id) DO UPDATE SET tag_id = excluded.tag_id, tag_value = excluded.tag_value, updated_at = excluded.updated_at`,
+		ft.FrameID, ft.TagID, ft.TagValue, time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+// ForgetFrameTag removes the record for a frame.
+func (s *State) ForgetFrameTag(ctx context.Context, frameID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM frame_tag WHERE frame_id = ?`, frameID)
+	return err
+}

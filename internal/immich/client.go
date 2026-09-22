@@ -2,16 +2,17 @@
 // surface this daemon needs: connectivity check, tag lookup/upsert, metadata
 // search, and rendition download.
 //
-// Everything except Download goes through immich-go. immich-go only exposes
-// the original-file download, and this daemon needs Immich's server-side
-// preview/fullsize renditions (they handle HEIC/RAW conversion) plus the
-// response Content-Type, so Download is a minimal direct call to
-// GET /api/assets/{id}/thumbnail|original using the same API key and the
-// same instrumented HTTP transport.
+// Everything immich-go covers goes through it. A few endpoints it lacks are
+// minimal direct calls using the same API key and instrumented transport:
+// Download (immich-go only exposes the original, and this daemon needs the
+// server-side preview/fullsize renditions plus the response Content-Type),
+// RenameTag and DeleteTag.
 package immich
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -241,6 +242,61 @@ func (c *Client) searchAll(ctx context.Context, q *immichgo.SearchMetadataQuery,
 	return out, err
 }
 
+// RenameTag changes a tag's leaf name (its parent cannot change).
+func (c *Client) RenameTag(ctx context.Context, id, name string) error {
+	ctx, span := tracer.Start(ctx, "immich.RenameTag", trace.WithAttributes(attribute.String("tag_id", id), attribute.String("name", name)))
+	defer span.End()
+	err := c.doJSON(ctx, http.MethodPut, "/api/tags/"+url.PathEscape(id), map[string]any{"name": name})
+	recordErr(span, err)
+	return err
+}
+
+// DeleteTag deletes a tag; Immich unlinks it from its assets.
+func (c *Client) DeleteTag(ctx context.Context, id string) error {
+	ctx, span := tracer.Start(ctx, "immich.DeleteTag", trace.WithAttributes(attribute.String("tag_id", id)))
+	defer span.End()
+	err := c.doJSON(ctx, http.MethodDelete, "/api/tags/"+url.PathEscape(id), nil)
+	recordErr(span, err)
+	return err
+}
+
+// TagAssetCount returns how many (non-trashed) assets carry the tag.
+func (c *Client) TagAssetCount(ctx context.Context, tagID string) (int, error) {
+	a, err := c.searchAll(ctx, &immichgo.SearchMetadataQuery{TagIds: []string{tagID}}, true)
+	return len(a), err
+}
+
+// doJSON performs a small JSON request not covered by immich-go.
+func (c *Client) doJSON(ctx context.Context, method, path string, body any) error {
+	var rd io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		rd = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, rd)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("x-api-key", c.apiKey)
+	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return &HTTPError{Status: resp.StatusCode, Body: string(b)}
+	}
+	return nil
+}
+
 // Download fetches the given rendition. It returns the bytes and the
 // Content-Type reported by the server.
 func (c *Client) Download(ctx context.Context, id string, r Rendition) (data []byte, mime string, err error) {
@@ -280,7 +336,7 @@ func (c *Client) Download(ctx context.Context, id string, r Rendition) (data []b
 	return data, mime, nil
 }
 
-// HTTPError is a non-2xx response from Download.
+// HTTPError is a non-2xx response from a direct call.
 type HTTPError struct {
 	Status int
 	Body   string
