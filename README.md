@@ -9,9 +9,9 @@ Un-favorite it → optionally removed from the frame.
 
 ```
 ┌────────┐   search/metadata    ┌─────────────────┐   upload_url + S3 PUT   ┌──────────┐
-│        │ ───────────────────▶ │                 │ ──────────────────────▶ │          │
+│        │ ──────────────────▶ │                 │ ─────────────────────▶ │          │
 │ Immich │                      │ immich-skylight │                         │ Skylight │
-│        │ ◀─────────────────── │     (daemon)    │ ──────────────────────▶ │  frame   │
+│        │ ◀────────────────── │     (daemon)    │ ─────────────────────▶ │  frame   │
 │        │  thumbnail/original  │                 │  delete (reverse sync)  │          │
 └────────┘                      └────────┬────────┘                         └──────────┘
                                          │
