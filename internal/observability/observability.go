@@ -72,7 +72,7 @@ func Init(ctx context.Context, o Options) (*Providers, error) {
 	}
 
 	p := &Providers{}
-	stdout := &traceHandler{Handler: slog.NewJSONHandler(o.Stdout, &slog.HandlerOptions{Level: o.Level})}
+	stdout := &traceHandler{Handler: slog.NewJSONHandler(o.Stdout, &slog.HandlerOptions{Level: o.Level, ReplaceAttr: humanizeAttr})}
 	handlers := []slog.Handler{stdout}
 
 	// OTel metrics are exported over OTLP only. Prometheus scraping is served by
@@ -173,6 +173,14 @@ func (h *traceHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 
 func (h *traceHandler) WithGroup(name string) slog.Handler {
 	return &traceHandler{Handler: h.Handler.WithGroup(name)}
+}
+
+// humanizeAttr renders durations as strings ("15m0s") instead of nanoseconds.
+func humanizeAttr(_ []string, a slog.Attr) slog.Attr {
+	if a.Value.Kind() == slog.KindDuration {
+		return slog.String(a.Key, a.Value.Duration().String())
+	}
+	return a
 }
 
 // ParseLevel converts a string to a slog.Level (defaults to Info).
