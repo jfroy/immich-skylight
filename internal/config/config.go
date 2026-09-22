@@ -37,6 +37,10 @@ type Config struct {
 	// .Name and .ID) to produce an Immich tag path whose assets go to that
 	// frame only. Empty disables per-frame tags.
 	FrameTagTemplate string
+	// PruneFrameTags deletes frame tags recorded in state whose frame is no
+	// longer a sync target. Off by default: deleting a tag unlinks it from
+	// every asset.
+	PruneFrameTags bool
 
 	// Skylight
 	SkylightEmail    string
@@ -70,6 +74,7 @@ func Load() (*Config, error) {
 		ImageSource:      ImageSource(strings.ToLower(env("IMMICH_IMAGE_SOURCE", string(SourcePreview)))),
 		IncludeVideo:     envBool("INCLUDE_VIDEOS", false),
 		FrameTagTemplate: env("IMMICH_FRAME_TAG_TEMPLATE", "Skylight/{{ .Name }}"),
+		PruneFrameTags:   envBool("PRUNE_FRAME_TAGS", false),
 		SkylightEmail:    env("SKYLIGHT_EMAIL", ""),
 		SkylightPassword: env("SKYLIGHT_PASSWORD", ""),
 		FrameIDs:         envList("SKYLIGHT_FRAME_IDS"),

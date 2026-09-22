@@ -151,6 +151,7 @@ All configuration is via environment variables.
 | `IMMICH_TAGS` | — | Comma-separated tag names or full paths (`Skylight`, `Family/Skylight`). Case-insensitive. Any listed tag qualifies. |
 | `IMMICH_IMAGE_SOURCE` | `preview` | `preview` (~1440px JPEG), `fullsize`, or `original`. Falls back down the chain if unavailable/unsupported. |
 | `INCLUDE_VIDEOS` | `false` | Also send MP4/MOV originals. |
+| `PRUNE_FRAME_TAGS` | `false` | Delete a frame's tag from Immich once the frame is no longer a sync target. Needs `tag.delete`. |
 | `IMMICH_FRAME_TAG_TEMPLATE` | `Skylight/{{ .Name }}` | Go `text/template` rendered per target frame (`.Name`, `.ID`) giving an Immich tag path; assets with that tag go only to that frame. The tags are created at startup. Set empty to disable. |
 | `SKYLIGHT_EMAIL` / `SKYLIGHT_PASSWORD` | — | Your Skylight account. **Required.** |
 | `SKYLIGHT_FRAME_IDS` | — | Comma-separated frame IDs. Optional: with exactly one frame on the account it is selected automatically. See [Choosing a frame](#choosing-a-frame-optional). |
@@ -178,8 +179,23 @@ Create the key with only these permissions (Immich → Account Settings → API 
 | `asset.download` | `GET /assets/{id}/original` — `IMMICH_IMAGE_SOURCE=original`, videos, and `fullsize` when Immich redirects to the original |
 | `tag.read` | `GET /tags` — resolving `IMMICH_TAGS` |
 | `tag.create` | `PUT /tags` — upserting the per-frame tags (`IMMICH_FRAME_TAG_TEMPLATE`). Not needed if that is disabled. |
+| `tag.update` | `PUT /tags/{id}` — renaming a frame tag when its frame is renamed in Skylight. Optional; without it a frame rename fails at startup with a clear error. |
+| `tag.delete` | `DELETE /tags/{id}` — only with `PRUNE_FRAME_TAGS=true`. |
 
-The key never modifies assets; it only reads them and creates tags.
+The key never modifies assets; it only reads them and manages the tags it created.
+
+#### Frame tag lifecycle
+
+The tag created for each frame is recorded (frame ID → tag ID) so it survives changes:
+
+- **Frame renamed in Skylight** — the tag is renamed in place (`Skylight/Kitchen` →
+  `Skylight/Living Room`); its photos follow, nothing is re-uploaded or removed.
+- **Template changed** so the tag's *parent* differs (`Skylight/…` → `Frames/…`) — a new
+  tag is created; the old one is left untouched and a warning reports how many assets
+  still carry it. Move them yourself, then delete the old tag.
+- **Frame no longer a target** (removed from `SKYLIGHT_FRAME_*` or from the account) — the
+  tag stays by default and a warning is logged each start. Set `PRUNE_FRAME_TAGS=true` to
+  delete it (this also unlinks it from all its photos).
 
 At least one of `IMMICH_FAVORITES=true`, `IMMICH_TAGS`, or `IMMICH_FRAME_TAG_TEMPLATE` must
 be set (all three are on by default via favorites + the frame tag template).

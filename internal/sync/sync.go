@@ -122,41 +122,141 @@ func New(ctx context.Context, o Options) (*Syncer, error) {
 	return s, nil
 }
 
-// setupFrameTags renders the tag template for each target frame and makes sure
-// the tags exist in Immich.
+// setupFrameTags reconciles per-frame Immich tags with the target frames:
+//
+//   - a frame with no recorded tag gets one upserted from the template;
+//   - a frame whose recorded tag no longer matches the rendered path is
+//     renamed in place when only the leaf changed (frame renamed in
+//     Skylight), otherwise a new tag is upserted and the old one left alone
+//     with a warning;
+//   - recorded tags for frames that are no longer targets are deleted when
+//     PRUNE_FRAME_TAGS is set, else reported.
 func (s *Syncer) setupFrameTags(ctx context.Context, frames []skylight.Frame) error {
 	s.frameTags = map[string]string{}
 	if s.cfg.FrameTagTemplate == "" {
 		return nil
 	}
+	ctx, span := tracer.Start(ctx, "sync.SetupFrameTags")
+	defer span.End()
+
 	tmpl, err := template.New("frame_tag").Parse(s.cfg.FrameTagTemplate)
 	if err != nil {
 		return fmt.Errorf("IMMICH_FRAME_TAG_TEMPLATE: %w", err)
 	}
-	paths := make([]string, 0, len(frames))
+	recorded, err := s.st.FrameTags(ctx)
+	if err != nil {
+		return fmt.Errorf("reading frame tags: %w", err)
+	}
+	existing, err := s.im.Tags(ctx)
+	if err != nil {
+		return err
+	}
+	byID := map[string]immich.Tag{}
+	for _, t := range existing {
+		byID[t.ID] = t
+	}
+
+	var toUpsert []string
+	var upsertFrames []skylight.Frame
+	seenValue := map[string]string{}
 	for _, f := range frames {
 		var b strings.Builder
 		if err := tmpl.Execute(&b, f); err != nil {
 			return fmt.Errorf("rendering frame tag for %q: %w", f.Name, err)
 		}
-		p := strings.Trim(strings.TrimSpace(b.String()), "/")
-		if p == "" {
+		want := strings.Trim(strings.TrimSpace(b.String()), "/")
+		if want == "" {
 			return fmt.Errorf("frame tag template rendered empty for frame %q", f.Name)
 		}
-		paths = append(paths, p)
-	}
-	tags, err := s.im.UpsertTags(ctx, paths)
-	if err != nil {
-		return err
-	}
-	for i, t := range tags {
-		if prev, dup := s.frameTags[t.ID]; dup {
-			return fmt.Errorf("frame tag %q resolves to both frame %s and %s; make the template unique per frame", t.Value, prev, frames[i].ID)
+		if other, dup := seenValue[want]; dup {
+			return fmt.Errorf("frame tag %q resolves to both frame %s and %s; make the template unique per frame", want, other, f.ID)
 		}
-		s.frameTags[t.ID] = frames[i].ID
-		s.log.Info("frame tag", "frame", frames[i].Name, "tag", t.Value, "tag_id", t.ID)
+		seenValue[want] = f.ID
+
+		rec, have := recorded[f.ID]
+		cur, alive := byID[rec.TagID]
+		switch {
+		case have && alive && strings.EqualFold(cur.Value, want):
+			s.frameTags[cur.ID] = f.ID
+			if cur.Value != rec.TagValue {
+				_ = s.st.SetFrameTag(ctx, state.FrameTag{FrameID: f.ID, TagID: cur.ID, TagValue: cur.Value})
+			}
+		case have && alive && parentOf(cur.Value) == parentOf(want):
+			// Frame renamed: rename our tag so its photos follow.
+			if err := s.im.RenameTag(ctx, cur.ID, leafOf(want)); err != nil {
+				return fmt.Errorf("renaming frame tag %q -> %q (needs tag.update): %w", cur.Value, want, err)
+			}
+			s.log.InfoContext(ctx, "frame tag renamed", "frame", f.Name, "from", cur.Value, "to", want)
+			if err := s.st.SetFrameTag(ctx, state.FrameTag{FrameID: f.ID, TagID: cur.ID, TagValue: want}); err != nil {
+				return err
+			}
+			s.frameTags[cur.ID] = f.ID
+		default:
+			if have && alive {
+				n, _ := s.im.TagAssetCount(ctx, cur.ID)
+				s.log.WarnContext(ctx, "frame tag path changed beyond a rename; leaving old tag in place",
+					"frame", f.Name, "old", cur.Value, "new", want, "assets_on_old_tag", n)
+			}
+			toUpsert = append(toUpsert, want)
+			upsertFrames = append(upsertFrames, f)
+		}
+	}
+
+	if len(toUpsert) > 0 {
+		tags, err := s.im.UpsertTags(ctx, toUpsert)
+		if err != nil {
+			return err
+		}
+		for i, t := range tags {
+			f := upsertFrames[i]
+			s.frameTags[t.ID] = f.ID
+			if err := s.st.SetFrameTag(ctx, state.FrameTag{FrameID: f.ID, TagID: t.ID, TagValue: t.Value}); err != nil {
+				return err
+			}
+			s.log.InfoContext(ctx, "frame tag", "frame", f.Name, "tag", t.Value, "tag_id", t.ID)
+		}
+	}
+
+	// Stale records: frames no longer targeted.
+	targets := map[string]bool{}
+	for _, f := range frames {
+		targets[f.ID] = true
+	}
+	for frameID, rec := range recorded {
+		if targets[frameID] {
+			continue
+		}
+		cur, alive := byID[rec.TagID]
+		if !alive {
+			_ = s.st.ForgetFrameTag(ctx, frameID)
+			continue
+		}
+		if !s.cfg.PruneFrameTags {
+			n, _ := s.im.TagAssetCount(ctx, cur.ID)
+			s.log.WarnContext(ctx, "frame is no longer a target; its tag remains (set PRUNE_FRAME_TAGS=true to delete)",
+				"frame_id", frameID, "tag", cur.Value, "assets", n)
+			continue
+		}
+		if err := s.im.DeleteTag(ctx, cur.ID); err != nil {
+			return fmt.Errorf("pruning frame tag %q (needs tag.delete): %w", cur.Value, err)
+		}
+		s.log.InfoContext(ctx, "frame tag pruned", "frame_id", frameID, "tag", cur.Value)
+		if err := s.st.ForgetFrameTag(ctx, frameID); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func parentOf(path string) string {
+	if i := strings.LastIndex(path, "/"); i >= 0 {
+		return path[:i]
+	}
+	return ""
+}
+
+func leafOf(path string) string {
+	return path[strings.LastIndex(path, "/")+1:]
 }
 
 // Trigger requests an immediate sync pass from Run. It never blocks; if a
