@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -114,11 +115,22 @@ func run(ctx context.Context, cmd string) error {
 		return listFrames(ctx, cfg, st, log, rec)
 	}
 
-	var syncer *isync.Syncer
-	var ready func() bool = func() bool { return syncer.Ready() }
+	var syncer atomic.Pointer[isync.Syncer]
+	ready := func() bool { return syncer.Load().Ready() }
 
 	// Start the HTTP listener before setup so liveness works during a slow start.
-	srv := server.New(cfg.HTTPAddr, registry, ready)
+	srv := server.New(server.Options{
+		Addr: cfg.HTTPAddr, Registry: registry, Ready: ready, Logger: log,
+		WebhookSecret: cfg.WebhookSecret,
+		OnWebhook: func() {
+			if s := syncer.Load(); s != nil {
+				s.Trigger()
+			}
+		},
+	})
+	if cfg.WebhookSecret != "" {
+		log.Info("webhook enabled", "path", "/webhook")
+	}
 	srvErr := make(chan error, 1)
 	go func() {
 		log.Info("http listening", "addr", cfg.HTTPAddr)
@@ -135,24 +147,26 @@ func run(ctx context.Context, cmd string) error {
 	setup := func() (*isync.Syncer, error) {
 		return isync.New(ctx, isync.Options{Config: cfg, State: st, Logger: log, Metrics: rec})
 	}
+	var sy *isync.Syncer
 	if cmd == "run" {
 		// Stay alive (liveness OK, readiness 503) while dependencies come up.
-		syncer, err = retrySetup(ctx, log, setup)
+		sy, err = retrySetup(ctx, log, setup)
 	} else {
-		syncer, err = setup()
+		sy, err = setup()
 	}
 	if err != nil {
 		return err
 	}
+	syncer.Store(sy)
 
 	done := make(chan error, 1)
 	go func() {
 		switch cmd {
 		case "sync":
-			done <- syncer.Once(ctx)
+			done <- sy.Once(ctx)
 		case "run":
 			log.Info("starting daemon", "interval", cfg.Interval, "state", cfg.StateFile, "dry_run", cfg.DryRun)
-			done <- syncer.Run(ctx)
+			done <- sy.Run(ctx)
 		default:
 			done <- fmt.Errorf("unknown command %q\n%s", cmd, usage)
 		}

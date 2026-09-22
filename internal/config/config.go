@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"text/template"
 	"time"
 )
 
@@ -32,6 +33,10 @@ type Config struct {
 	Tags         []string
 	ImageSource  ImageSource
 	IncludeVideo bool
+	// FrameTagTemplate is a text/template rendered per target frame (fields
+	// .Name and .ID) to produce an Immich tag path whose assets go to that
+	// frame only. Empty disables per-frame tags.
+	FrameTagTemplate string
 
 	// Skylight
 	SkylightEmail    string
@@ -48,6 +53,10 @@ type Config struct {
 	LogLevel    string
 	HTTPAddr    string // metrics/health listener
 	ServiceName string
+	// WebhookSecret, when set, enables POST /webhook (Immich workflow webhook
+	// action) which triggers an immediate sync pass. The request must carry the
+	// secret in the X-Webhook-Secret header.
+	WebhookSecret string
 }
 
 // Load reads configuration from the environment. Missing required values are
@@ -60,6 +69,7 @@ func Load() (*Config, error) {
 		Tags:             envList("IMMICH_TAGS"),
 		ImageSource:      ImageSource(strings.ToLower(env("IMMICH_IMAGE_SOURCE", string(SourcePreview)))),
 		IncludeVideo:     envBool("INCLUDE_VIDEOS", false),
+		FrameTagTemplate: env("IMMICH_FRAME_TAG_TEMPLATE", "Skylight/{{ .Name }}"),
 		SkylightEmail:    env("SKYLIGHT_EMAIL", ""),
 		SkylightPassword: env("SKYLIGHT_PASSWORD", ""),
 		FrameIDs:         envList("SKYLIGHT_FRAME_IDS"),
@@ -71,6 +81,7 @@ func Load() (*Config, error) {
 		LogLevel:         env("LOG_LEVEL", "info"),
 		HTTPAddr:         env("HTTP_ADDR", ":8080"),
 		ServiceName:      env("OTEL_SERVICE_NAME", "immich-skylight"),
+		WebhookSecret:    env("WEBHOOK_SECRET", ""),
 	}
 
 	var errs []error
@@ -83,8 +94,13 @@ func Load() (*Config, error) {
 	if c.SkylightEmail == "" || c.SkylightPassword == "" {
 		errs = append(errs, errors.New("SKYLIGHT_EMAIL and SKYLIGHT_PASSWORD are required"))
 	}
-	if !c.Favorites && len(c.Tags) == 0 {
-		errs = append(errs, errors.New("nothing selected: set IMMICH_FAVORITES=true and/or IMMICH_TAGS"))
+	if !c.Favorites && len(c.Tags) == 0 && c.FrameTagTemplate == "" {
+		errs = append(errs, errors.New("nothing selected: set IMMICH_FAVORITES=true, IMMICH_TAGS and/or IMMICH_FRAME_TAG_TEMPLATE"))
+	}
+	if c.FrameTagTemplate != "" {
+		if _, err := template.New("frame_tag").Parse(c.FrameTagTemplate); err != nil {
+			errs = append(errs, fmt.Errorf("IMMICH_FRAME_TAG_TEMPLATE: %w", err))
+		}
 	}
 	switch c.ImageSource {
 	case SourcePreview, SourceFullsize, SourceOriginal:

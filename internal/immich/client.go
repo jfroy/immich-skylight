@@ -118,6 +118,59 @@ func (c *Client) ResolveTags(ctx context.Context, wanted []string) ([]string, er
 	return ids, nil
 }
 
+// UpsertTags creates hierarchical tags by path ("Skylight/Kitchen") if they do
+// not exist and returns them in input order.
+func (c *Client) UpsertTags(ctx context.Context, paths []string) ([]Tag, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	ctx, span := tracer.Start(ctx, "immich.UpsertTags", trace.WithAttributes(attribute.StringSlice("paths", paths)))
+	defer span.End()
+	var tags []Tag
+	err := c.putJSON(ctx, "/api/tags", map[string]any{"tags": paths}, &tags)
+	if err != nil {
+		recordErr(span, err)
+		return nil, fmt.Errorf("upserting immich tags: %w", err)
+	}
+	// The response is not guaranteed to be ordered; re-order by path.
+	out := make([]Tag, 0, len(paths))
+	for _, p := range paths {
+		found := false
+		for _, t := range tags {
+			if strings.EqualFold(t.Value, p) {
+				out = append(out, t)
+				found = true
+				break
+			}
+		}
+		if !found {
+			err := fmt.Errorf("immich did not return upserted tag %q", p)
+			recordErr(span, err)
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// SearchByTag returns all assets carrying a single tag.
+func (c *Client) SearchByTag(ctx context.Context, tagID string, includeVideo bool) ([]Asset, error) {
+	ctx, span := tracer.Start(ctx, "immich.SearchByTag", trace.WithAttributes(attribute.String("tag_id", tagID)))
+	defer span.End()
+	all, err := c.searchAll(ctx, map[string]any{"tagIds": []string{tagID}})
+	if err != nil {
+		recordErr(span, err)
+		return nil, err
+	}
+	var out []Asset
+	for _, a := range all {
+		if a.Type == "VIDEO" && !includeVideo {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out, nil
+}
+
 // SearchOptions controls Search.
 type SearchOptions struct {
 	Favorites    bool     // isFavorite=true
@@ -273,6 +326,19 @@ func (c *Client) postJSON(ctx context.Context, path string, in, out any) error {
 		return err
 	}
 	req, err := c.newRequest(ctx, http.MethodPost, path, bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return c.doJSON(req, out)
+}
+
+func (c *Client) putJSON(ctx context.Context, path string, in, out any) error {
+	b, err := json.Marshal(in)
+	if err != nil {
+		return err
+	}
+	req, err := c.newRequest(ctx, http.MethodPut, path, bytes.NewReader(b))
 	if err != nil {
 		return err
 	}

@@ -26,7 +26,10 @@ import (
 type fakeImmich struct {
 	mu        sync.Mutex
 	favorites []map[string]any
-	tagged    []map[string]any
+	tagged    []map[string]any            // assets for tag-1 (IMMICH_TAGS)
+	byTag     map[string][]map[string]any // assets for frame tags, by tag id
+	tags      map[string]string           // tag id -> path
+	upserts   [][]string
 	downloads int
 }
 
@@ -48,15 +51,51 @@ func (f *fakeImmich) handler(t *testing.T) http.Handler {
 		fmt.Fprint(w, `{"email":"me@x"}`)
 	})
 	mux.HandleFunc("/api/tags", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `[{"id":"tag-1","name":"Skylight","value":"Family/Skylight"}]`)
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.tags == nil {
+			f.tags = map[string]string{"tag-1": "Family/Skylight"}
+		}
+		if r.Method == http.MethodPut {
+			var body struct {
+				Tags []string `json:"tags"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			f.upserts = append(f.upserts, body.Tags)
+			var out []map[string]any
+			for _, p := range body.Tags {
+				id := ""
+				for k, v := range f.tags {
+					if v == p {
+						id = k
+					}
+				}
+				if id == "" {
+					id = "tag-" + strings.ToLower(strings.ReplaceAll(p, "/", "-"))
+					f.tags[id] = p
+				}
+				out = append(out, map[string]any{"id": id, "name": p[strings.LastIndex(p, "/")+1:], "value": p})
+			}
+			_ = json.NewEncoder(w).Encode(out)
+			return
+		}
+		var out []map[string]any
+		for k, v := range f.tags {
+			out = append(out, map[string]any{"id": k, "name": v[strings.LastIndex(v, "/")+1:], "value": v})
+		}
+		_ = json.NewEncoder(w).Encode(out)
 	})
 	mux.HandleFunc("/api/search/metadata", func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		f.mu.Lock()
 		items := f.favorites
-		if _, ok := body["tagIds"]; ok {
-			items = f.tagged
+		if ids, ok := body["tagIds"].([]any); ok && len(ids) == 1 {
+			if id := ids[0].(string); id == "tag-1" {
+				items = f.tagged
+			} else {
+				items = f.byTag[id]
+			}
 		}
 		f.mu.Unlock()
 		if body["page"].(float64) > 1 {
@@ -92,15 +131,17 @@ func (f *fakeImmich) handler(t *testing.T) http.Handler {
 
 // fakeSkylight emulates login, frames, presigned upload and delete.
 type fakeSkylight struct {
-	mu       sync.Mutex
-	logins   int
-	refresh  int
-	uploads  map[int]string // message id -> body
-	deleted  []int
-	captions []string
-	nextID   int
-	expireIn int
-	revoked  string // bearer token that should be rejected
+	mu          sync.Mutex
+	logins      int
+	refresh     int
+	uploads     map[int]string // message id -> body
+	uploadFrame map[int]string // message id -> frame
+	deleted     []int
+	deletedFrom map[string][]int
+	captions    []string
+	nextID      int
+	expireIn    int
+	revoked     string // bearer token that should be rejected
 }
 
 func (f *fakeSkylight) handler(t *testing.T, self func() string) http.Handler {
@@ -179,13 +220,17 @@ func (f *fakeSkylight) handler(t *testing.T, self func() string) http.Handler {
 			Caption  string   `json:"caption"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		if body.Ext != "jpg" || len(body.FrameIDs) != 1 || body.FrameIDs[0] != "111" {
+		if body.Ext != "jpg" || len(body.FrameIDs) != 1 || (body.FrameIDs[0] != "111" && body.FrameIDs[0] != "222") {
 			t.Errorf("bad upload_url body: %+v", body)
 		}
 		f.mu.Lock()
 		f.nextID++
 		id := f.nextID
 		f.captions = append(f.captions, body.Caption)
+		if f.uploadFrame == nil {
+			f.uploadFrame = map[int]string{}
+		}
+		f.uploadFrame[id] = body.FrameIDs[0]
 		f.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
 			"url": self() + "/s3/" + fmt.Sprint(id), "message_ids": []int{id}, "frame_names": []string{"Kitchen"},
@@ -207,19 +252,26 @@ func (f *fakeSkylight) handler(t *testing.T, self func() string) http.Handler {
 		f.mu.Unlock()
 		w.WriteHeader(200)
 	})
-	mux.HandleFunc("/api/frames/111/messages/destroy_multiple", func(w http.ResponseWriter, r *http.Request) {
-		if !auth(w, r) || r.Method != http.MethodDelete {
-			return
-		}
-		var body struct {
-			IDs []int `json:"message_ids"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		f.mu.Lock()
-		f.deleted = append(f.deleted, body.IDs...)
-		f.mu.Unlock()
-		w.WriteHeader(204)
-	})
+	for _, frame := range []string{"111", "222"} {
+		frame := frame
+		mux.HandleFunc("/api/frames/"+frame+"/messages/destroy_multiple", func(w http.ResponseWriter, r *http.Request) {
+			if !auth(w, r) || r.Method != http.MethodDelete {
+				return
+			}
+			var body struct {
+				IDs []int `json:"message_ids"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			f.mu.Lock()
+			f.deleted = append(f.deleted, body.IDs...)
+			if f.deletedFrom == nil {
+				f.deletedFrom = map[string][]int{}
+			}
+			f.deletedFrom[frame] = append(f.deletedFrom[frame], body.IDs...)
+			f.mu.Unlock()
+			w.WriteHeader(204)
+		})
+	}
 	return mux
 }
 
@@ -254,7 +306,7 @@ func setup(t *testing.T, cfgMut func(*config.Config)) (*fakeImmich, *fakeSkyligh
 	cfg := &config.Config{
 		ImmichURL: imSrv.URL, ImmichAPIKey: "key", Favorites: true,
 		ImageSource: config.SourcePreview, SkylightEmail: "e", SkylightPassword: "pw",
-		FrameNames: []string{"kitchen"}, UseCaption: true, Interval: time.Hour,
+		FrameNames: []string{"kitchen"}, UseCaption: true, Interval: time.Hour, FrameTagTemplate: "",
 		StateFile: filepath.Join(t.TempDir(), "state.db"),
 	}
 	if cfgMut != nil {
@@ -442,5 +494,76 @@ func TestReauthOn401(t *testing.T) {
 	}
 	if fs.refresh == 0 {
 		t.Errorf("expected a token refresh after 401")
+	}
+}
+
+func TestFrameTags(t *testing.T) {
+	fi, fs, cfg, st := setup(t, func(c *config.Config) {
+		c.Favorites = true
+		c.FrameNames = []string{"Kitchen", "Office"}
+		c.FrameTagTemplate = "Skylight/{{ .Name }}"
+		c.RemoveUnselected = true
+	})
+	fi.favorites = []map[string]any{asset("fav", "image/jpeg", "IMAGE")}
+	fi.byTag = map[string][]map[string]any{
+		"tag-skylight-kitchen": {asset("k", "image/jpeg", "IMAGE")},
+		"tag-skylight-office":  {asset("o", "image/jpeg", "IMAGE"), asset("fav", "image/jpeg", "IMAGE")},
+	}
+	ctx := context.Background()
+	s, err := newSyncer(t, cfg, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fi.upserts) != 1 || strings.Join(fi.upserts[0], ",") != "Skylight/Kitchen,Skylight/Office" {
+		t.Fatalf("upserts = %v", fi.upserts)
+	}
+	if err := s.Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// fav -> both frames (favorite); k -> 111 only; o -> 222 only. 4 uploads.
+	perFrame := map[string]int{}
+	for _, f := range fs.uploadFrame {
+		perFrame[f]++
+	}
+	if perFrame["111"] != 2 || perFrame["222"] != 2 {
+		t.Fatalf("uploads per frame = %v", perFrame)
+	}
+	rec, _, _ := st.Get(ctx, "k")
+	if len(rec.Messages) != 1 || len(rec.Messages["111"]) != 1 {
+		t.Errorf("k state = %+v", rec)
+	}
+	rec, _, _ = st.Get(ctx, "fav")
+	if len(rec.Messages) != 2 {
+		t.Errorf("fav state = %+v", rec)
+	}
+
+	// Move k from Kitchen to Office: removed from 111, added to 222; fav untouched.
+	fi.mu.Lock()
+	fi.byTag["tag-skylight-kitchen"] = nil
+	fi.byTag["tag-skylight-office"] = append(fi.byTag["tag-skylight-office"], asset("k", "image/jpeg", "IMAGE"))
+	fi.mu.Unlock()
+	if err := s.Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(fs.deletedFrom["111"]) != 1 || len(fs.deletedFrom["222"]) != 0 {
+		t.Errorf("deletedFrom = %v", fs.deletedFrom)
+	}
+	rec, ok, _ := st.Get(ctx, "k")
+	if !ok || len(rec.Messages["111"]) != 0 || len(rec.Messages["222"]) != 1 {
+		t.Errorf("k after move = %+v", rec)
+	}
+	if n, _ := st.Count(ctx); n != 3 {
+		t.Errorf("tracked = %d", n)
+	}
+}
+
+func TestTriggerCoalesces(t *testing.T) {
+	s := &Syncer{trigger: make(chan struct{}, 1)}
+	s.Trigger()
+	s.Trigger() // must not block
+	select {
+	case <-s.trigger:
+	default:
+		t.Fatal("trigger not queued")
 	}
 }
