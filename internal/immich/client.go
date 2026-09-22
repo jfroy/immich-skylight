@@ -1,11 +1,17 @@
-// Package immich is a minimal client for the parts of the Immich API needed
-// to select and download assets.
+// Package immich adapts github.com/simulot/immich-go's client to the small
+// surface this daemon needs: connectivity check, tag lookup/upsert, metadata
+// search, and rendition download.
+//
+// Everything except Download goes through immich-go. immich-go only exposes
+// the original-file download, and this daemon needs Immich's server-side
+// preview/fullsize renditions (they handle HEIC/RAW conversion) plus the
+// response Content-Type, so Download is a minimal direct call to
+// GET /api/assets/{id}/thumbnail|original using the same API key and the
+// same instrumented HTTP transport.
 package immich
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	immichgo "github.com/simulot/immich-go/immich"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -23,44 +30,68 @@ var tracer = otel.Tracer("github.com/jfroy/immich-skylight/internal/immich")
 
 // Client talks to an Immich server using an API key.
 type Client struct {
+	ic      *immichgo.ImmichClient
 	baseURL string
 	apiKey  string
 	http    *http.Client
 }
 
 // New creates a client. baseURL is the server root (e.g. https://photos.example.com).
-// hc may be nil, in which case a default client is used.
-func New(baseURL, apiKey string, hc *http.Client) *Client {
-	if hc == nil {
-		hc = &http.Client{Timeout: 5 * time.Minute}
+// rt, if non-nil, wraps the transport used for all requests (tracing/metrics).
+func New(baseURL, apiKey string, rt func(http.RoundTripper) http.RoundTripper, timeout time.Duration) (*Client, error) {
+	baseURL = strings.TrimRight(baseURL, "/")
+	var deco immichgo.RoundTripperDecorator
+	if rt != nil {
+		deco = rt
+	}
+	ic, err := immichgo.NewImmichClient(baseURL, apiKey,
+		// immich-go's option assigns InsecureSkipVerify = arg, so false = verify.
+		immichgo.OptionVerifySSL(false),
+		immichgo.OptionConnectionTimeout(timeout),
+		// nil decorator resets to the plain transport, so this is safe unconditionally.
+		immichgo.OptionSetAPITrace(deco),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("creating immich client: %w", err)
+	}
+
+	var base http.RoundTripper = http.DefaultTransport.(*http.Transport).Clone()
+	if rt != nil {
+		base = rt(base)
 	}
 	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
+		ic:      ic,
+		baseURL: baseURL,
 		apiKey:  apiKey,
-		http:    hc,
+		http:    &http.Client{Transport: base, Timeout: timeout},
+	}, nil
+}
+
+// Asset is the subset of an Immich asset the sync needs.
+type Asset struct {
+	ID               string
+	Type             string // IMAGE or VIDEO
+	OriginalFileName string
+	Checksum         string
+	IsFavorite       bool
+	FileCreatedAt    time.Time
+	Description      string
+}
+
+func fromGo(a *immichgo.Asset) Asset {
+	return Asset{
+		ID:               a.ID,
+		Type:             a.Type,
+		OriginalFileName: a.OriginalFileName,
+		Checksum:         a.Checksum,
+		IsFavorite:       a.IsFavorite,
+		FileCreatedAt:    a.FileCreatedAt.Time,
+		Description:      a.ExifInfo.Description,
 	}
 }
 
-// Asset is the subset of AssetResponseDto we care about.
-type Asset struct {
-	ID               string    `json:"id"`
-	Type             string    `json:"type"` // IMAGE or VIDEO
-	OriginalMimeType string    `json:"originalMimeType"`
-	OriginalFileName string    `json:"originalFileName"`
-	Checksum         string    `json:"checksum"`
-	IsFavorite       bool      `json:"isFavorite"`
-	FileCreatedAt    time.Time `json:"fileCreatedAt"`
-	ExifInfo         *struct {
-		Description string `json:"description"`
-	} `json:"exifInfo,omitempty"`
-}
-
-// Tag mirrors TagResponseDto.
-type Tag struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Value string `json:"value"` // full path, e.g. "Family/Skylight"
-}
+// Tag mirrors Immich's TagResponseDto.
+type Tag = immichgo.TagSimplified
 
 // Rendition identifies a downloadable version of an asset.
 type Rendition string
@@ -73,10 +104,7 @@ const (
 
 // Ping verifies connectivity and the API key.
 func (c *Client) Ping(ctx context.Context) error {
-	var me struct {
-		Email string `json:"email"`
-	}
-	if err := c.getJSON(ctx, "/api/users/me", &me); err != nil {
+	if _, err := c.ic.ValidateConnection(ctx); err != nil {
 		return fmt.Errorf("immich auth check failed: %w", err)
 	}
 	return nil
@@ -84,11 +112,7 @@ func (c *Client) Ping(ctx context.Context) error {
 
 // Tags returns all tags visible to the API key.
 func (c *Client) Tags(ctx context.Context) ([]Tag, error) {
-	var tags []Tag
-	if err := c.getJSON(ctx, "/api/tags", &tags); err != nil {
-		return nil, err
-	}
-	return tags, nil
+	return c.ic.GetAllTags(ctx)
 }
 
 // ResolveTags maps user-supplied names/paths to tag IDs. Matching is
@@ -126,13 +150,11 @@ func (c *Client) UpsertTags(ctx context.Context, paths []string) ([]Tag, error) 
 	}
 	ctx, span := tracer.Start(ctx, "immich.UpsertTags", trace.WithAttributes(attribute.StringSlice("paths", paths)))
 	defer span.End()
-	var tags []Tag
-	err := c.putJSON(ctx, "/api/tags", map[string]any{"tags": paths}, &tags)
+	tags, err := c.ic.UpsertTags(ctx, paths)
 	if err != nil {
 		recordErr(span, err)
 		return nil, fmt.Errorf("upserting immich tags: %w", err)
 	}
-	// The response is not guaranteed to be ordered; re-order by path.
 	out := make([]Tag, 0, len(paths))
 	for _, p := range paths {
 		found := false
@@ -156,19 +178,9 @@ func (c *Client) UpsertTags(ctx context.Context, paths []string) ([]Tag, error) 
 func (c *Client) SearchByTag(ctx context.Context, tagID string, includeVideo bool) ([]Asset, error) {
 	ctx, span := tracer.Start(ctx, "immich.SearchByTag", trace.WithAttributes(attribute.String("tag_id", tagID)))
 	defer span.End()
-	all, err := c.searchAll(ctx, map[string]any{"tagIds": []string{tagID}})
-	if err != nil {
-		recordErr(span, err)
-		return nil, err
-	}
-	var out []Asset
-	for _, a := range all {
-		if a.Type == "VIDEO" && !includeVideo {
-			continue
-		}
-		out = append(out, a)
-	}
-	return out, nil
+	out, err := c.searchAll(ctx, &immichgo.SearchMetadataQuery{TagIds: []string{tagID}}, includeVideo)
+	recordErr(span, err)
+	return out, err
 }
 
 // SearchOptions controls Search.
@@ -188,67 +200,45 @@ func (c *Client) Search(ctx context.Context, opts SearchOptions) (assets []Asset
 		span.End()
 	}()
 	seen := map[string]bool{}
-	var out []Asset
-	add := func(assets []Asset) {
-		for _, a := range assets {
-			if seen[a.ID] {
-				continue
+	add := func(list []Asset) {
+		for _, a := range list {
+			if !seen[a.ID] {
+				seen[a.ID] = true
+				assets = append(assets, a)
 			}
-			if a.Type == "VIDEO" && !opts.IncludeVideo {
-				continue
-			}
-			seen[a.ID] = true
-			out = append(out, a)
 		}
 	}
-
 	if opts.Favorites {
-		a, err := c.searchAll(ctx, map[string]any{"isFavorite": true})
+		a, err := c.searchAll(ctx, &immichgo.SearchMetadataQuery{IsFavorite: true}, opts.IncludeVideo)
 		if err != nil {
 			return nil, fmt.Errorf("searching favorites: %w", err)
 		}
 		add(a)
 	}
 	if len(opts.TagIDs) > 0 {
-		a, err := c.searchAll(ctx, map[string]any{"tagIds": opts.TagIDs})
+		a, err := c.searchAll(ctx, &immichgo.SearchMetadataQuery{TagIds: opts.TagIDs}, opts.IncludeVideo)
 		if err != nil {
 			return nil, fmt.Errorf("searching tags: %w", err)
 		}
 		add(a)
 	}
-	return out, nil
+	return assets, nil
 }
 
-// searchAll pages through POST /api/search/metadata.
-func (c *Client) searchAll(ctx context.Context, filter map[string]any) ([]Asset, error) {
-	var all []Asset
-	page := 1
-	for {
-		body := map[string]any{
-			"page":        page,
-			"size":        1000,
-			"withDeleted": false,
-			"withExif":    true,
-			"order":       "desc",
+// searchAll pages through POST /api/search/metadata via immich-go.
+func (c *Client) searchAll(ctx context.Context, q *immichgo.SearchMetadataQuery, includeVideo bool) ([]Asset, error) {
+	q.WithExif = true
+	q.WithDeleted = false
+	q.Size = 1000
+	var out []Asset
+	err := c.ic.GetAllAssetsWithFilter(ctx, q, func(a *immichgo.Asset) error {
+		if a.IsTrashed || (a.Type == "VIDEO" && !includeVideo) {
+			return nil
 		}
-		for k, v := range filter {
-			body[k] = v
-		}
-		var resp struct {
-			Assets struct {
-				Items    []Asset `json:"items"`
-				NextPage *string `json:"nextPage"`
-			} `json:"assets"`
-		}
-		if err := c.postJSON(ctx, "/api/search/metadata", body, &resp); err != nil {
-			return nil, err
-		}
-		all = append(all, resp.Assets.Items...)
-		if resp.Assets.NextPage == nil || *resp.Assets.NextPage == "" || len(resp.Assets.Items) == 0 {
-			return all, nil
-		}
-		page++
-	}
+		out = append(out, fromGo(a))
+		return nil
+	})
+	return out, err
 }
 
 // Download fetches the given rendition. It returns the bytes and the
@@ -261,16 +251,15 @@ func (c *Client) Download(ctx context.Context, id string, r Rendition) (data []b
 		recordErr(span, err)
 		span.End()
 	}()
-	var path string
-	if r == RenditionOriginal {
-		path = "/api/assets/" + url.PathEscape(id) + "/original"
-	} else {
+	path := "/api/assets/" + url.PathEscape(id) + "/original"
+	if r != RenditionOriginal {
 		path = "/api/assets/" + url.PathEscape(id) + "/thumbnail?size=" + string(r)
 	}
-	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
 	if err != nil {
 		return nil, "", err
 	}
+	req.Header.Set("x-api-key", c.apiKey)
 	req.Header.Set("Accept", "application/octet-stream")
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -281,18 +270,17 @@ func (c *Client) Download(ctx context.Context, id string, r Rendition) (data []b
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, "", &HTTPError{Status: resp.StatusCode, Body: string(b)}
 	}
-	data, err = io.ReadAll(resp.Body)
-	if err != nil {
+	if data, err = io.ReadAll(resp.Body); err != nil {
 		return nil, "", err
 	}
-	ct := resp.Header.Get("Content-Type")
-	if i := strings.Index(ct, ";"); i >= 0 {
-		ct = strings.TrimSpace(ct[:i])
+	mime = resp.Header.Get("Content-Type")
+	if i := strings.Index(mime, ";"); i >= 0 {
+		mime = strings.TrimSpace(mime[:i])
 	}
-	return data, ct, nil
+	return data, mime, nil
 }
 
-// HTTPError is a non-2xx response.
+// HTTPError is a non-2xx response from Download.
 type HTTPError struct {
 	Status int
 	Body   string
@@ -300,69 +288,6 @@ type HTTPError struct {
 
 func (e *HTTPError) Error() string {
 	return fmt.Sprintf("immich http %d: %s", e.Status, e.Body)
-}
-
-func (c *Client) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("x-api-key", c.apiKey)
-	req.Header.Set("Accept", "application/json")
-	return req, nil
-}
-
-func (c *Client) getJSON(ctx context.Context, path string, out any) error {
-	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
-	if err != nil {
-		return err
-	}
-	return c.doJSON(req, out)
-}
-
-func (c *Client) postJSON(ctx context.Context, path string, in, out any) error {
-	b, err := json.Marshal(in)
-	if err != nil {
-		return err
-	}
-	req, err := c.newRequest(ctx, http.MethodPost, path, bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	return c.doJSON(req, out)
-}
-
-func (c *Client) putJSON(ctx context.Context, path string, in, out any) error {
-	b, err := json.Marshal(in)
-	if err != nil {
-		return err
-	}
-	req, err := c.newRequest(ctx, http.MethodPut, path, bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	return c.doJSON(req, out)
-}
-
-func (c *Client) doJSON(req *http.Request, out any) error {
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return &HTTPError{Status: resp.StatusCode, Body: string(body)}
-	}
-	if out == nil {
-		return nil
-	}
-	return json.Unmarshal(body, out)
 }
 
 func recordErr(span trace.Span, err error) {

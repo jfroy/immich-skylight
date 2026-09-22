@@ -33,9 +33,11 @@ type fakeImmich struct {
 	downloads int
 }
 
+var extByMime = map[string]string{"image/jpeg": ".jpg", "image/heic": ".heic", "image/x-canon-cr2": ".cr2", "video/mp4": ".mp4"}
+
 func asset(id, mime, typ string) map[string]any {
 	return map[string]any{
-		"id": id, "type": typ, "originalMimeType": mime, "originalFileName": id + ".x",
+		"id": id, "type": typ, "originalMimeType": mime, "originalFileName": id + extByMime[mime],
 		"checksum": "sum-" + id, "isFavorite": true, "fileCreatedAt": time.Now(),
 		"exifInfo": map[string]any{"description": "caption " + id},
 	}
@@ -49,6 +51,9 @@ func (f *fakeImmich) handler(t *testing.T) http.Handler {
 			return
 		}
 		fmt.Fprint(w, `{"email":"me@x"}`)
+	})
+	mux.HandleFunc("/api/server/media-types", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"image":[".jpg",".heic"],"video":[".mp4"],"sidecar":[".xmp"]}`)
 	})
 	mux.HandleFunc("/api/tags", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()

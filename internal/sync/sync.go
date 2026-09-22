@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"mime"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"text/template"
@@ -63,12 +65,17 @@ func New(ctx context.Context, o Options) (*Syncer, error) {
 
 	cfg := o.Config
 	s := &Syncer{cfg: cfg, st: o.State, log: o.Logger, rec: o.Metrics, trigger: make(chan struct{}, 1)}
+	var err error
 
-	imHTTP := httpx.NewClient(o.Metrics, func(*http.Request) string { return "immich" }, 5*time.Minute)
-	s.im = immich.New(cfg.ImmichURL, cfg.ImmichAPIKey, imHTTP)
+	imClassify := func(*http.Request) string { return "immich" }
+	s.im, err = immich.New(cfg.ImmichURL, cfg.ImmichAPIKey, func(rt http.RoundTripper) http.RoundTripper {
+		return httpx.NewTransport(rt, o.Metrics, imClassify)
+	}, 5*time.Minute)
+	if err != nil {
+		return nil, fail(span, err)
+	}
 
 	skyHTTP := httpx.NewClient(o.Metrics, nil, 5*time.Minute)
-	var err error
 	s.sky, err = skylight.New(skylight.Options{
 		Email:       cfg.SkylightEmail,
 		Password:    cfg.SkylightPassword,
@@ -321,8 +328,8 @@ func (s *Syncer) upload(ctx context.Context, a immich.Asset, frames []string, ex
 	span.SetAttributes(attribute.String("rendition", rendition), attribute.String("ext", ext), attribute.Int("bytes", len(data)))
 
 	caption := ""
-	if s.cfg.UseCaption && a.ExifInfo != nil {
-		caption = strings.TrimSpace(a.ExifInfo.Description)
+	if s.cfg.UseCaption {
+		caption = strings.TrimSpace(a.Description)
 	}
 
 	if s.cfg.DryRun {
@@ -373,8 +380,8 @@ func (s *Syncer) fetch(ctx context.Context, a immich.Asset) (data []byte, ext, r
 	var lastErr error
 	for _, r := range chain {
 		rendition = string(r)
-		if r == immich.RenditionOriginal && skylight.SupportedExt(a.OriginalMimeType) == "" {
-			lastErr = fmt.Errorf("original type %s not supported by skylight", a.OriginalMimeType)
+		if r == immich.RenditionOriginal && skylight.SupportedExt(mimeByName(a.OriginalFileName)) == "" {
+			lastErr = fmt.Errorf("original %s is not a type skylight accepts", filepath.Ext(a.OriginalFileName))
 			continue
 		}
 		var mime string
@@ -452,6 +459,20 @@ func (s *Syncer) removeUnselected(ctx context.Context, desired map[string]map[st
 		s.rec.Removed(ctx, "success", removed)
 	}
 	return removed
+}
+
+// mimeByName guesses a MIME type from a filename extension (used only to skip
+// downloading originals Skylight cannot display; the server's Content-Type
+// decides what is actually uploaded).
+func mimeByName(name string) string {
+	ext := strings.ToLower(filepath.Ext(name))
+	switch ext {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".mov":
+		return "video/quicktime"
+	}
+	return mime.TypeByExtension(ext)
 }
 
 func (s *Syncer) record(ctx context.Context, result, rendition string, n int) {
