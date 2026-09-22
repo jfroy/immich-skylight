@@ -23,7 +23,9 @@ Un-favorite it → optionally removed from the frame.
 ```
 
 1. **Select** – queries Immich for favorites and/or assets carrying configured tags
-   (`POST /api/search/metadata`), unioned and de-duplicated.
+   (`POST /api/search/metadata`). These go to every target frame. In addition, a
+   **per-frame tag** (default `Skylight/<frame name>`) is created in Immich for each
+   frame; tagging a photo with it sends it to that frame only.
 2. **Fetch** – downloads Immich's `preview` rendition by default: a JPEG that already
    handles HEIC/RAW conversion and is plenty for a frame's display. `fullsize` and
    `original` are available; anything Skylight can't accept falls back to `preview`.
@@ -37,7 +39,11 @@ Un-favorite it → optionally removed from the frame.
    sent twice and photos can be deleted later. Each upload is its own transaction; a
    crash mid-pass cannot lose or duplicate a record.
 5. **Reverse sync** (optional, `REMOVE_UNSELECTED=true`) – photos no longer
-   favorited/tagged in Immich are deleted from the frame.
+   favorited/tagged in Immich are deleted from the frame(s) they are no longer selected
+   for, so re-tagging a photo from one frame's tag to another's moves it.
+6. **Push** (optional) – an Immich Workflow with the *Asset Tagged* trigger and the
+   *Webhook* action can `POST` to `/webhook` so new photos land within seconds instead
+   of waiting for the next poll. See [Instant sync](#instant-sync-with-immich-workflows).
 
 > **Caveat:** Skylight has no public API. All Skylight protocol handling is delegated to
 > [go-skylight](https://github.com/sebrandon1/go-skylight), a community client that
@@ -145,6 +151,7 @@ All configuration is via environment variables.
 | `IMMICH_TAGS` | — | Comma-separated tag names or full paths (`Skylight`, `Family/Skylight`). Case-insensitive. Any listed tag qualifies. |
 | `IMMICH_IMAGE_SOURCE` | `preview` | `preview` (~1440px JPEG), `fullsize`, or `original`. Falls back down the chain if unavailable/unsupported. |
 | `INCLUDE_VIDEOS` | `false` | Also send MP4/MOV originals. |
+| `IMMICH_FRAME_TAG_TEMPLATE` | `Skylight/{{ .Name }}` | Go `text/template` rendered per target frame (`.Name`, `.ID`) giving an Immich tag path; assets with that tag go only to that frame. The tags are created at startup. Set empty to disable. |
 | `SKYLIGHT_EMAIL` / `SKYLIGHT_PASSWORD` | — | Your Skylight account. **Required.** |
 | `SKYLIGHT_FRAME_IDS` | — | Comma-separated frame IDs. Optional: with exactly one frame on the account it is selected automatically. See [Choosing a frame](#choosing-a-frame-optional). |
 | `SKYLIGHT_FRAME_NAMES` | — | Alternative to IDs; case-insensitive match on the frame name as shown in the Skylight app. |
@@ -154,11 +161,31 @@ All configuration is via environment variables.
 | `STATE_FILE` | `/data/state.db` | SQLite database holding tokens and sent-asset records. WAL sidecar files (`-wal`, `-shm`) are created alongside. Back it up if you care about `REMOVE_UNSELECTED`. |
 | `DRY_RUN` | `false` | Log what would be uploaded/removed without touching Skylight. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
-| `HTTP_ADDR` | `:8080` | Listener for `/metrics`, `/healthz`, `/readyz`. |
+| `HTTP_ADDR` | `:8080` | Listener for `/metrics`, `/healthz`, `/readyz`, `/webhook`. |
+| `WEBHOOK_SECRET` | — | Enables `POST /webhook`; requests must send this value in `X-Webhook-Secret`. |
 | `OTEL_SERVICE_NAME` | `immich-skylight` | Service name in telemetry. |
 | `OTEL_EXPORTER_OTLP_*` | — | Standard OTel SDK variables. Setting an endpoint enables OTLP export of traces, metrics and logs. |
 
-Either `IMMICH_FAVORITES=true` or at least one `IMMICH_TAGS` entry must be set.
+At least one of `IMMICH_FAVORITES=true`, `IMMICH_TAGS`, or `IMMICH_FRAME_TAG_TEMPLATE` must
+be set (all three are on by default via favorites + the frame tag template).
+
+### Instant sync with Immich Workflows
+
+Polling (`SYNC_INTERVAL`) always runs, but Immich ≥ 3.2 can push. Set `WEBHOOK_SECRET`
+to a random string, expose the `http` port to Immich (in-cluster Service / Compose
+network is enough; no ingress needed), then in Immich → *Utilities → Workflows* create:
+
+- **Trigger:** Asset Tagged
+- **Filter (optional):** Asset Tag — any of your `Skylight/*` tags and `IMMICH_TAGS`
+- **Action:** Trigger Webhook
+  - URL: `http://immich-skylight:8080/webhook`
+  - Method: `POST`
+  - Header name: `X-Webhook-Secret`, Header value: your secret
+
+Each hit schedules an immediate sync pass (coalesced if several arrive at once). The
+payload is only used as a nudge — the pass re-reads Immich as the source of truth — so a
+missed or duplicate webhook is harmless. Favoriting has no workflow trigger yet; it is
+picked up on the next poll.
 
 ## Observability
 

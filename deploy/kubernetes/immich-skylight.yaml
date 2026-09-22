@@ -2,7 +2,8 @@
 # Plain Kubernetes deployment (Deployment + PVC + Service).
 # Create the Secret first:
 #   kubectl create secret generic immich-skylight \
-#     --from-literal=IMMICH_API_KEY=... --from-literal=SKYLIGHT_EMAIL=... --from-literal=SKYLIGHT_PASSWORD=...
+#     --from-literal=IMMICH_API_KEY=... --from-literal=SKYLIGHT_EMAIL=... --from-literal=SKYLIGHT_PASSWORD=... \
+#     --from-literal=WEBHOOK_SECRET=$(openssl rand -hex 24)   # optional: enables /webhook for Immich Workflows
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
