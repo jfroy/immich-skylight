@@ -163,6 +163,9 @@ const (
 	RenditionOriginal Rendition = "original"
 	RenditionFullsize Rendition = "fullsize"
 	RenditionPreview  Rendition = "preview"
+	// RenditionPlayback is Immich's transcoded video (H.264 MP4 by default),
+	// falling back to the original when no transcode exists.
+	RenditionPlayback Rendition = "playback"
 )
 
 // Blob is a downloaded rendition.
@@ -332,16 +335,32 @@ func Collect(seq iter.Seq2[Asset, error]) ([]Asset, error) {
 	return out, nil
 }
 
-// Download fetches a rendition. Renditions other than the original are served
+// ErrTooLarge is returned by Download when a rendition exceeds MaxDownloadBytes
+// (or the per-call limit). Callers can errors.Is against it to fall through
+// to a smaller rendition.
+var ErrTooLarge = errors.New("immich: rendition exceeds size limit")
+
+// Download fetches a rendition. Images other than the original are served
 // from /thumbnail?size=...; Immich may redirect fullsize to the original.
-func (c *Client) Download(ctx context.Context, id string, r Rendition) (_ *Blob, err error) {
+// limit, if > 0, caps this download below MaxDownloadBytes.
+func (c *Client) Download(ctx context.Context, id string, r Rendition, limit int64) (_ *Blob, err error) {
 	ctx, span := tracer.Start(ctx, "immich.Download", trace.WithAttributes(
 		attribute.String("asset_id", id), attribute.String("rendition", string(r))))
 	defer func() { recordErr(span, err); span.End() }()
 
-	path := "/api/assets/" + url.PathEscape(id) + "/original"
-	if r != RenditionOriginal {
-		path = "/api/assets/" + url.PathEscape(id) + "/thumbnail?size=" + url.QueryEscape(string(r))
+	maxBytes := c.maxBytes
+	if limit > 0 && limit < maxBytes {
+		maxBytes = limit
+	}
+	base := "/api/assets/" + url.PathEscape(id)
+	var path string
+	switch r {
+	case RenditionOriginal:
+		path = base + "/original"
+	case RenditionPlayback:
+		path = base + "/video/playback"
+	default:
+		path = base + "/thumbnail?size=" + url.QueryEscape(string(r))
 	}
 	resp, err := c.roundTrip(ctx, http.MethodGet, path, nil, "application/octet-stream")
 	if err != nil {
@@ -349,11 +368,15 @@ func (c *Client) Download(ctx context.Context, id string, r Rendition) (_ *Blob,
 	}
 	defer drain(resp.Body)
 
-	if resp.ContentLength > c.maxBytes {
-		return nil, fmt.Errorf("immich: asset %s rendition %s is %d bytes, over the %d byte limit", id, r, resp.ContentLength, c.maxBytes)
+	if resp.ContentLength > maxBytes {
+		return nil, fmt.Errorf("%w: asset %s rendition %s is %d bytes, limit %d", ErrTooLarge, id, r, resp.ContentLength, maxBytes)
 	}
-	data, err := io.ReadAll(http.MaxBytesReader(nil, resp.Body, c.maxBytes))
+	data, err := io.ReadAll(http.MaxBytesReader(nil, resp.Body, maxBytes))
 	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			return nil, fmt.Errorf("%w: asset %s rendition %s exceeds %d bytes", ErrTooLarge, id, r, maxBytes)
+		}
 		return nil, fmt.Errorf("immich: reading %s: %w", path, err)
 	}
 	ct, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))

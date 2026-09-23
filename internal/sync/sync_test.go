@@ -144,6 +144,16 @@ func (f *fakeImmich) handler(t *testing.T) http.Handler {
 		parts := strings.Split(r.URL.Path, "/")
 		id := parts[3]
 		switch {
+		case strings.HasSuffix(r.URL.Path, "/video/playback"):
+			if id == "notranscoded" {
+				http.Error(w, "no playback", 404)
+				return
+			}
+			w.Header().Set("Content-Type", "video/mp4")
+			fmt.Fprint(w, "PLAYBACK-"+id)
+		case strings.HasSuffix(r.URL.Path, "/original") && strings.HasPrefix(id, "big"):
+			w.Header().Set("Content-Type", "image/jpeg")
+			fmt.Fprint(w, strings.Repeat("B", 2000))
 		case strings.HasSuffix(r.URL.Path, "/original"):
 			if id == "heic" {
 				w.Header().Set("Content-Type", "image/heic")
@@ -261,7 +271,7 @@ func (f *fakeSkylight) handler(t *testing.T, self func() string) http.Handler {
 			Caption  string   `json:"caption"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		if body.Ext != "jpg" || len(body.FrameIDs) != 1 || (body.FrameIDs[0] != "111" && body.FrameIDs[0] != "222") {
+		if (body.Ext != "jpg" && body.Ext != "mp4" && body.Ext != "mov") || len(body.FrameIDs) != 1 || (body.FrameIDs[0] != "111" && body.FrameIDs[0] != "222") {
 			t.Errorf("bad upload_url body: %+v", body)
 		}
 		f.mu.Lock()
@@ -348,7 +358,8 @@ func setup(t *testing.T, cfgMut func(*config.Config)) (*fakeImmich, *fakeSkyligh
 		ImmichURL: imSrv.URL, ImmichAPIKey: "key", Favorites: true,
 		ImageSource: config.SourcePreview, SkylightEmail: "e", SkylightPassword: "pw",
 		FrameNames: []string{"kitchen"}, UseCaption: true, Interval: time.Hour, FrameTagTemplate: "",
-		StateFile: filepath.Join(t.TempDir(), "state.db"),
+		MaxUploadBytes: 25 << 20,
+		StateFile:      filepath.Join(t.TempDir(), "state.db"),
 	}
 	if cfgMut != nil {
 		cfgMut(cfg)
@@ -684,5 +695,53 @@ func TestFrameTagLifecycle(t *testing.T) {
 	ft, _ = st.FrameTags(ctx)
 	if _, ok := ft["222"]; ok || len(ft) != 1 {
 		t.Errorf("pruned record remains: %+v", ft)
+	}
+}
+
+func TestVideosAndSizeCap(t *testing.T) {
+	fi, fs, cfg, st := setup(t, func(c *config.Config) {
+		c.IncludeVideo = true
+		c.ImageSource = config.SourceOriginal
+		c.MaxUploadBytes = 1000
+	})
+	fi.favorites = []map[string]any{
+		asset("vid", "video/quicktime", "VIDEO"),    // -> playback mp4
+		asset("notranscoded", "video/mp4", "VIDEO"), // playback 404 -> original
+		asset("big", "image/jpeg", "IMAGE"),         // original 2000B > cap -> fullsize
+	}
+	s, err := newSyncer(t, cfg, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Once(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var bodies []string
+	for _, b := range fs.uploads {
+		bodies = append(bodies, b)
+	}
+	joined := strings.Join(bodies, ",")
+	for _, want := range []string{"PLAYBACK-vid", "ORIGINAL-notranscoded", "FULLSIZE-big"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("missing %s in %v", want, bodies)
+		}
+	}
+	if strings.Contains(joined, "BBBB") {
+		t.Error("oversized original was uploaded")
+	}
+}
+
+func TestVideosSkippedWhenDisabled(t *testing.T) {
+	fi, fs, cfg, st := setup(t, nil) // IncludeVideo false
+	fi.favorites = []map[string]any{asset("vid", "video/mp4", "VIDEO"), asset("a", "image/jpeg", "IMAGE")}
+	s, err := newSyncer(t, cfg, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Once(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fs.uploads) != 1 {
+		t.Errorf("uploads = %d, want 1 (video skipped)", len(fs.uploads))
 	}
 }

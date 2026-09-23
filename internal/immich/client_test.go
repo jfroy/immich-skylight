@@ -256,6 +256,10 @@ func TestDownload(t *testing.T) {
 		case r.URL.Query().Get("size") == "preview":
 			w.Header().Set("Content-Type", "image/jpeg; charset=binary")
 			fmt.Fprint(w, "PREVIEW")
+		case strings.HasSuffix(r.URL.Path, "/video/playback"):
+			w.Header().Set("Content-Type", "video/mp4")
+			w.(http.Flusher).Flush() // force chunked: no Content-Length
+			fmt.Fprint(w, strings.Repeat("v", 500))
 		case r.URL.Query().Get("size") == "fullsize":
 			w.Header().Set("Content-Type", "image/jpeg")
 			w.Header().Set("Content-Length", "1000")
@@ -263,17 +267,25 @@ func TestDownload(t *testing.T) {
 		}
 	}))
 	ctx := context.Background()
-	b, err := c.Download(ctx, "id", RenditionPreview)
+	b, err := c.Download(ctx, "id", RenditionPreview, 0)
 	if err != nil || string(b.Data) != "PREVIEW" || b.ContentType != "image/jpeg" {
 		t.Errorf("preview: %+v %v", b, err)
 	}
-	b, err = c.Download(ctx, "id", RenditionOriginal)
+	b, err = c.Download(ctx, "id", RenditionOriginal, 0)
 	if err != nil || string(b.Data) != "ORIG" || b.ContentType != "image/heic" {
 		t.Errorf("original: %+v %v", b, err)
 	}
-	c.maxBytes = 100
-	if _, err := c.Download(ctx, "id", RenditionFullsize); err == nil {
-		t.Error("oversized download accepted")
+	// Content-Length over the limit is rejected before reading.
+	if _, err := c.Download(ctx, "id", RenditionFullsize, 100); !errors.Is(err, ErrTooLarge) {
+		t.Errorf("oversized (content-length): %v", err)
+	}
+	// Chunked body over the limit is rejected while reading.
+	if _, err := c.Download(ctx, "id", RenditionPlayback, 10); !errors.Is(err, ErrTooLarge) {
+		t.Errorf("oversized (streamed): %v", err)
+	}
+	b, err = c.Download(ctx, "id", RenditionPlayback, 0)
+	if err != nil || b.ContentType != "video/mp4" {
+		t.Errorf("playback: %+v %v", b, err)
 	}
 }
 
