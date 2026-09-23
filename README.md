@@ -28,7 +28,9 @@ Un-favorite it → optionally removed from the frame.
    frame; tagging a photo with it sends it to that frame only.
 2. **Fetch** – downloads Immich's `preview` rendition by default: a JPEG that already
    handles HEIC/RAW conversion and is plenty for a frame's display. `fullsize` and
-   `original` are available; anything Skylight can't accept falls back to `preview`.
+   `original` are available; anything Skylight can't accept, or anything over
+   `MAX_UPLOAD_BYTES`, falls back to the next smaller rendition. Videos (opt-in, Frame
+   Plus only) use Immich's transcoded playback file, falling back to the original.
 3. **Upload** – via [go-skylight](https://github.com/sebrandon1/go-skylight): headless
    OAuth login with your email/password, `POST /api/upload_url` for a pre-signed URL,
    then a direct `PUT` of the bytes. This daemon owns the credential lifecycle: refresh
@@ -150,7 +152,8 @@ All configuration is via environment variables.
 | `IMMICH_FAVORITES` | `true` | Sync favorited photos. |
 | `IMMICH_TAGS` | — | Comma-separated tag names or full paths (`Skylight`, `Family/Skylight`). Case-insensitive. Any listed tag qualifies. |
 | `IMMICH_IMAGE_SOURCE` | `preview` | `preview` (~1440px JPEG), `fullsize`, or `original`. Falls back down the chain if unavailable/unsupported. |
-| `INCLUDE_VIDEOS` | `false` | Also send MP4/MOV originals. |
+| `INCLUDE_VIDEOS` | `false` | Also send videos. Requires Skylight **Frame Plus**. Immich's transcoded playback (H.264 MP4) is preferred over the original since it is usually far smaller. |
+| `MAX_UPLOAD_BYTES` | `25M` | Cap per upload (Skylight's documented limit). Accepts `K`/`M`/`G` suffixes. A rendition over the cap falls through to the next smaller one (`original → fullsize → preview`, `playback → original`); if none fits the asset is skipped with a warning and counted as `too_large`. |
 | `PRUNE_FRAME_TAGS` | `false` | Delete a frame's tag from Immich once the frame is no longer a sync target. Needs `tag.delete`. |
 | `IMMICH_FRAME_TAG_TEMPLATE` | `Skylight/{{ .Name }}` | Go `text/template` rendered per target frame (`.Name`, `.ID`) giving an Immich tag path; assets with that tag go only to that frame. The tags are created at startup. Set empty to disable. |
 | `SKYLIGHT_EMAIL` / `SKYLIGHT_PASSWORD` | — | Your Skylight account. **Required.** |
@@ -175,7 +178,7 @@ Create the key with only these permissions (Immich → Account Settings → API 
 |---|---|
 | `user.read` | `GET /users/me` — connectivity/auth check at startup |
 | `asset.read` | `POST /search/metadata` — finding favorites and tagged assets |
-| `asset.view` | `GET /assets/{id}/thumbnail` — the default `preview`/`fullsize` renditions |
+| `asset.view` | `GET /assets/{id}/thumbnail` and `GET /assets/{id}/video/playback` — the default `preview`/`fullsize` image renditions and transcoded video |
 | `asset.download` | `GET /assets/{id}/original` — `IMMICH_IMAGE_SOURCE=original`, videos, and `fullsize` when Immich redirects to the original |
 | `tag.read` | `GET /tags` — resolving `IMMICH_TAGS` |
 | `tag.create` | `PUT /tags` — upserting the per-frame tags (`IMMICH_FRAME_TAG_TEMPLATE`). Not needed if that is disabled. |
@@ -233,7 +236,7 @@ picked up on the next poll.
   | `immich_skylight_sync_duration_seconds` | histogram |
   | `immich_skylight_sync_last_success_timestamp_seconds` | alert if stale |
   | `immich_skylight_selected_assets`, `immich_skylight_tracked_assets` | gauges |
-  | `immich_skylight_uploads_total{result,rendition}` | success / fetch_failed / upload_failed / dry_run |
+  | `immich_skylight_uploads_total{result,rendition}` | success / fetch_failed / too_large / upload_failed / dry_run |
   | `immich_skylight_upload_size_bytes` | histogram |
   | `immich_skylight_removals_total{result}` | reverse-sync deletions |
   | `immich_skylight_skylight_auth_total{kind,result}` | login / refresh events |

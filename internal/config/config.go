@@ -33,6 +33,10 @@ type Config struct {
 	Tags         []string
 	ImageSource  ImageSource
 	IncludeVideo bool
+	// MaxUploadBytes caps any single upload to Skylight. Renditions over the
+	// cap fall through to the next smaller one; if none fits, the asset is
+	// skipped with a warning. Skylight's documented limit is 25 MB.
+	MaxUploadBytes int64
 	// FrameTagTemplate is a text/template rendered per target frame (fields
 	// .Name and .ID) to produce an Immich tag path whose assets go to that
 	// frame only. Empty disables per-frame tags.
@@ -73,6 +77,7 @@ func Load() (*Config, error) {
 		Tags:             envList("IMMICH_TAGS"),
 		ImageSource:      ImageSource(strings.ToLower(env("IMMICH_IMAGE_SOURCE", string(SourcePreview)))),
 		IncludeVideo:     envBool("INCLUDE_VIDEOS", false),
+		MaxUploadBytes:   envBytes("MAX_UPLOAD_BYTES", 25<<20),
 		FrameTagTemplate: env("IMMICH_FRAME_TAG_TEMPLATE", "Skylight/{{ .Name }}"),
 		PruneFrameTags:   envBool("PRUNE_FRAME_TAGS", false),
 		SkylightEmail:    env("SKYLIGHT_EMAIL", ""),
@@ -101,6 +106,9 @@ func Load() (*Config, error) {
 	}
 	if !c.Favorites && len(c.Tags) == 0 && c.FrameTagTemplate == "" {
 		errs = append(errs, errors.New("nothing selected: set IMMICH_FAVORITES=true, IMMICH_TAGS and/or IMMICH_FRAME_TAG_TEMPLATE"))
+	}
+	if c.MaxUploadBytes <= 0 {
+		errs = append(errs, errors.New("MAX_UPLOAD_BYTES must be positive"))
 	}
 	if c.FrameTagTemplate != "" {
 		if _, err := template.New("frame_tag").Parse(c.FrameTagTemplate); err != nil {
@@ -153,4 +161,26 @@ func envList(key string) []string {
 		}
 	}
 	return out
+}
+
+// envBytes parses a byte count with an optional K/M/G (binary) suffix.
+func envBytes(key string, def int64) int64 {
+	v := strings.ToUpper(env(key, ""))
+	if v == "" {
+		return def
+	}
+	mult := int64(1)
+	switch {
+	case strings.HasSuffix(v, "G"):
+		mult, v = 1<<30, strings.TrimSuffix(v, "G")
+	case strings.HasSuffix(v, "M"):
+		mult, v = 1<<20, strings.TrimSuffix(v, "M")
+	case strings.HasSuffix(v, "K"):
+		mult, v = 1<<10, strings.TrimSuffix(v, "K")
+	}
+	n, err := strconv.ParseInt(strings.TrimSuffix(strings.TrimSpace(v), "B"), 10, 64)
+	if err != nil {
+		return -1 // fails validation with a clear message
+	}
+	return n * mult
 }

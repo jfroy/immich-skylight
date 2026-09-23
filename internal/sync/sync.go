@@ -409,13 +409,22 @@ func (s *Syncer) desired(ctx context.Context) (map[string]map[string]bool, []imm
 	for tagID, frameID := range s.frameTags {
 		queries = append(queries, q{immich.Query{TagIDs: []string{tagID}, IncludeVideo: s.cfg.IncludeVideo}, []string{frameID}, "frame tag"})
 	}
+	skippedVideos := 0
 	for _, qq := range queries {
+		qq.query.IncludeVideo = true // filter here so skipped videos can be reported
 		for a, err := range s.im.Assets(ctx, qq.query) {
 			if err != nil {
 				return nil, nil, fmt.Errorf("searching %s: %w", qq.what, err)
 			}
+			if a.Type == "VIDEO" && !s.cfg.IncludeVideo {
+				skippedVideos++
+				continue
+			}
 			add(a, qq.frames)
 		}
+	}
+	if skippedVideos > 0 {
+		s.log.InfoContext(ctx, "videos selected but INCLUDE_VIDEOS is false; skipping", "count", skippedVideos)
 	}
 	return desired, order, nil
 }
@@ -440,7 +449,11 @@ func (s *Syncer) upload(ctx context.Context, a immich.Asset, frames []string, ex
 
 	data, ext, rendition, err := s.fetch(ctx, a)
 	if err != nil {
-		s.record(ctx, "fetch_failed", rendition, 0)
+		result := "fetch_failed"
+		if errors.Is(err, immich.ErrTooLarge) {
+			result = "too_large"
+		}
+		s.record(ctx, result, rendition, 0)
 		return err
 	}
 	span.SetAttributes(attribute.String("rendition", rendition), attribute.String("format", ext), attribute.Int("bytes", len(data)))
@@ -492,7 +505,9 @@ func (s *Syncer) fetch(ctx context.Context, a immich.Asset) (data []byte, ext, r
 		chain = []immich.Rendition{immich.RenditionPreview}
 	}
 	if a.Type == "VIDEO" {
-		chain = []immich.Rendition{immich.RenditionOriginal}
+		// Prefer Immich's transcode (smaller, H.264 MP4); the original is the
+		// only alternative and frequently exceeds Skylight's size limit.
+		chain = []immich.Rendition{immich.RenditionPlayback, immich.RenditionOriginal}
 	}
 
 	var lastErr error
@@ -502,9 +517,13 @@ func (s *Syncer) fetch(ctx context.Context, a immich.Asset) (data []byte, ext, r
 			lastErr = fmt.Errorf("original type %s not supported by skylight", a.OriginalMimeType)
 			continue
 		}
-		blob, err := s.im.Download(ctx, a.ID, r)
+		blob, err := s.im.Download(ctx, a.ID, r, s.cfg.MaxUploadBytes)
 		if err != nil {
-			lastErr = fmt.Errorf("download %s: %w", r, err)
+			if errors.Is(err, immich.ErrTooLarge) {
+				lastErr = fmt.Errorf("%w (MAX_UPLOAD_BYTES=%d)", err, s.cfg.MaxUploadBytes)
+			} else {
+				lastErr = fmt.Errorf("download %s: %w", r, err)
+			}
 			continue
 		}
 		if ext = skylight.SupportedExt(blob.ContentType); ext == "" {
