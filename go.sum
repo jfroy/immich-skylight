@@ -51,6 +51,10 @@ github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec h1:W09IVJc94
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=
 github.com/sebrandon1/go-skylight v0.2.2 h1:MSQr9SfVlFoCil1z+AXlCKPNDpwgkWi7WYbyZXxrUec=
 github.com/sebrandon1/go-skylight v0.2.2/go.mod h1:tpIjZPV3Bur1iKXX4jkJo61vi07a4vuS8fFPHuEmC6k=
+github.com/sebrandon1/go-skylight v0.2.10 h1:Qv1Wtj/rLL+Kd6O83z7OPvjcrzbI4bvqWQ6d2Nra9NA=
+github.com/sebrandon1/go-skylight v0.2.10/go.mod h1:wZsu4qFGJFK2exBDl/MB9KR64ufgEdtodYlY6hDFkoo=
+github.com/sebrandon1/go-toolbox v0.1.2 h1:dBDATy6gCNzszWUpV5C4yWf5n+aMwRbhVY+4cbHpWbw=
+github.com/sebrandon1/go-toolbox v0.1.2/go.mod h1:mv+ke07P4yQ/kyTZG/JFgyF71xrW0O8juypeI4zHKO4=
 github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=
 github.com/stretchr/testify v1.12.1/go.mod h1:MDEgiDPPsNp5cuIrHPPCyornHKgEVbtFUmoNlxoYthg=
 go.opentelemetry.io/auto/sdk v1.2.1 h1:jXsnJ4Lmnqd11kwkBV2LgLoFMZKizbCi5fNZ/ipaZ64=

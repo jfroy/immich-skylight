@@ -5,7 +5,7 @@ go 1.27.0
 require (
 	github.com/golang-migrate/migrate/v4 v4.20.1
 	github.com/prometheus/client_golang v1.24.1
-	github.com/sebrandon1/go-skylight v0.2.2
+	github.com/sebrandon1/go-skylight v0.2.10
 	go.opentelemetry.io/contrib/bridges/otelslog v0.20.1
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.71.0
 	go.opentelemetry.io/otel v1.46.0
@@ -37,6 +37,7 @@ require (
 	github.com/prometheus/common v0.70.1 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	github.com/sebrandon1/go-toolbox v0.1.2 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.46.0 // indirect
 	go.opentelemetry.io/otel/log v0.22.0 // indirect
